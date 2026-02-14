@@ -132,7 +132,8 @@ class RocketTile private(
 
   override lazy val module = new RocketTileModuleImp(this)
 
-  val systolic_node = BundleBridgeSink[SystolicBundle]()
+  val systolicInNode = BundleBridgeSink[SystolicMeshToTileBundle]()
+  val systolicOutNode = BundleBridgeSource[SystolicTileToMeshBundle]()
 
   override def makeMasterBoundaryBuffers(crossing: ClockCrossingType)(implicit p: Parameters) = (rocketParams.boundaryBuffers, crossing) match {
     case (Some(RocketTileBoundaryBufferParams(true )), _)                   => TLBuffer()
@@ -154,28 +155,28 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
   Annotated.params(this, outer.rocketParams)
 
   // Systolic IO via Diplomacy
-  val systolic_io = outer.systolic_node.bundle
+  val systolic_in = outer.systolicInNode.bundle
+  val systolic_out = outer.systolicOutNode.bundle
 
   val core = Module(new Rocket(outer)(outer.p))
-  systolic_io.systolic_master_ctrl := core.io.systolic_master_ctrl
 
   // --- Systolic Mesh Interface Integration ---
   val systolic_if = Module(new SystolicInterface()(outer.p))
   
   // 1. Wire to External Mesh (Diplomatic IOs)
-  systolic_if.io.west_in          <> systolic_io.west_in
-  systolic_if.io.north_in         <> systolic_io.north_in
-  systolic_io.east_out            <> systolic_if.io.east_out
-  systolic_io.south_out           <> systolic_if.io.south_out
-  systolic_if.io.systolic_enable := systolic_io.systolic_enable
-  systolic_if.io.systolic_stall  := systolic_io.systolic_stall
+  systolic_if.io.west_in         <> systolic_in.west_in
+  systolic_if.io.north_in        <> systolic_in.north_in
+  systolic_out.east_out          <> systolic_if.io.east_out
+  systolic_out.south_out         <> systolic_if.io.south_out
+  systolic_if.io.systolic_enable := systolic_in.systolic_enable
+  systolic_if.io.systolic_stall  := systolic_in.systolic_stall
 
   // 2. Wire to Internal Core Pipeline
   core.io.systolic_opA          := systolic_if.io.alu_opA
   core.io.systolic_opB          := systolic_if.io.alu_opB
-  core.io.systolic_enable       := systolic_io.systolic_enable
-  core.io.systolic_stall        := systolic_io.systolic_stall
-  systolic_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+  core.io.systolic_enable       := systolic_in.systolic_enable
+  core.io.systolic_stall        := systolic_in.systolic_stall
+  systolic_out.systolic_master_ctrl := core.io.systolic_master_ctrl
 
   // 3. Wire Core Data Injection (For Software Mesh Control)
   systolic_if.io.core_data_in   := core.io.systolic_data_out
