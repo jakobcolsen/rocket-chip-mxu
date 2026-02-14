@@ -4,14 +4,17 @@
 package freechips.rocketchip.tile
 
 import chisel3._
+import chisel3.util._
+
 
 import org.chipsalliance.cde.config._
 import org.chipsalliance.diplomacy.lazymodule._
 
 import freechips.rocketchip.devices.tilelink.{BasicBusBlockerParams, BasicBusBlocker}
 import freechips.rocketchip.diplomacy.{
-  AddressSet, DisableMonitors, BufferParams
+  AddressSet, DisableMonitors, BufferParams, BundleBridgeSource, BundleBridgeSink, BundleBridgeNode
 }
+
 import freechips.rocketchip.resources.{
   SimpleDevice, Description,
   ResourceAnchors, ResourceBindings, ResourceBinding, Resource, ResourceAddress,
@@ -69,7 +72,11 @@ class RocketTile private(
 
   val intOutwardNode = rocketParams.beuAddr map { _ => IntIdentityNode() }
   val slaveNode = TLIdentityNode()
+
   val masterNode = visibilityNode
+
+
+
 
   val dtim_adapter = tileParams.dcache.flatMap { d => d.scratch.map { s =>
     LazyModule(new ScratchpadSlavePort(AddressSet.misaligned(s, d.dataScratchpadBytes), lazyCoreParamsView.coreDataBytes, tileParams.core.useAtomics && !tileParams.core.useAtomicsOnlyForIO))
@@ -125,6 +132,8 @@ class RocketTile private(
 
   override lazy val module = new RocketTileModuleImp(this)
 
+  val systolic_node = BundleBridgeSink[SystolicBundle]()
+
   override def makeMasterBoundaryBuffers(crossing: ClockCrossingType)(implicit p: Parameters) = (rocketParams.boundaryBuffers, crossing) match {
     case (Some(RocketTileBoundaryBufferParams(true )), _)                   => TLBuffer()
     case (Some(RocketTileBoundaryBufferParams(false)), _: RationalCrossing) => TLBuffer(BufferParams.none, BufferParams.flow, BufferParams.none, BufferParams.flow, BufferParams(1))
@@ -144,7 +153,34 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     with HasICacheFrontendModule {
   Annotated.params(this, outer.rocketParams)
 
+  // Systolic IO via Diplomacy
+  val systolic_io = outer.systolic_node.bundle
+
   val core = Module(new Rocket(outer)(outer.p))
+  systolic_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+
+  // --- Systolic Mesh Interface Integration ---
+  val systolic_if = Module(new SystolicInterface()(outer.p))
+  
+  // 1. Wire to External Mesh (Diplomatic IOs)
+  systolic_if.io.west_in          <> systolic_io.west_in
+  systolic_if.io.north_in         <> systolic_io.north_in
+  systolic_io.east_out            <> systolic_if.io.east_out
+  systolic_io.south_out           <> systolic_if.io.south_out
+  systolic_if.io.systolic_enable := systolic_io.systolic_enable
+  systolic_if.io.systolic_stall  := systolic_io.systolic_stall
+
+  // 2. Wire to Internal Core Pipeline
+  core.io.systolic_opA          := systolic_if.io.alu_opA
+  core.io.systolic_opB          := systolic_if.io.alu_opB
+  core.io.systolic_enable       := systolic_io.systolic_enable
+  core.io.systolic_stall        := systolic_io.systolic_stall
+  systolic_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+
+  // 3. Wire Core Data Injection (For Software Mesh Control)
+  systolic_if.io.core_data_in   := core.io.systolic_data_out
+  systolic_if.io.core_data_wen  := core.io.systolic_data_wen
+
   outer.vector_unit.foreach { v =>
     core.io.vector.get <> v.module.io.core
     v.module.io.tlb <> outer.dcache.module.io.tlb_port
@@ -199,7 +235,9 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
   } }
   core.io.ptw <> ptw.io.dpath
 
+
   // Connect the coprocessor interfaces
+
   if (outer.roccs.size > 0) {
     cmdRouter.get.io.in <> core.io.rocc.cmd
     outer.roccs.foreach{ lm =>

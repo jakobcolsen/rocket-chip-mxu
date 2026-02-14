@@ -121,7 +121,18 @@ class RocketCustomCSRs(implicit p: Parameters) extends CustomCSRs with HasRocket
   // mimpid encodes a release version in the form of a BCD-encoded datestamp.
   def mimpid = CustomCSR.constant(CSRs.mimpid, BigInt(rocketParams.mimpid))
 
-  override def decls = super.decls :+ marchid :+ mvendorid :+ mimpid
+  // Systolic Control CSR (Head Node Control)
+  def systolicCSR = CustomCSR(0x800, BigInt(1), Some(BigInt(0))) // Address 0x800, Bit 0 writable
+
+  // Systolic Data CSR (Data Exchange)
+  def systolicDataCSR = CustomCSR(0x801, BigInt(0), Some(BigInt(0)))
+
+  def systolicMasterCtrl = getByIdOrElse(0x800, _.value(0), false.B)
+  def systolicDataOut    = getByIdOrElse(0x801, _.wdata, 0.U)
+  def systolicDataWen    = getByIdOrElse(0x801, _.wen, false.B)
+
+  override def decls = super.decls :+ marchid :+ mvendorid :+ mimpid :+ systolicCSR :+ systolicDataCSR
+
 }
 
 class CoreInterrupts(val hasBeu: Boolean)(implicit p: Parameters) extends TileInterrupts()(p) {
@@ -146,6 +157,17 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val wfi = Output(Bool())
     val traceStall = Input(Bool())
     val vector = if (usingVector) Some(Flipped(new VectorCoreIO)) else None
+    
+    // Systolic Interface (Simplified)
+    val systolic_opA = Input(UInt(xLen.W))
+    val systolic_opB = Input(UInt(xLen.W))
+    val systolic_enable = Input(Bool())
+    val systolic_stall = Input(Bool())
+    val systolic_master_ctrl = Output(Bool())
+    val systolic_data_out = Output(UInt(xLen.W))
+    val systolic_data_wen = Output(Bool())
+
+
   })
 }
 
@@ -161,6 +183,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_reg_pause = Reg(Bool())
   val imem_might_request_reg = Reg(Bool())
   val clock_en = WireDefault(true.B)
+  when (io.systolic_stall && !reset.asBool) { clock_en := false.B }
+
   val gated_clock =
     if (!rocketParams.clockGate) clock
     else ClockGate(clock, clock_en, "rocket_clock_gate")
@@ -339,6 +363,37 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_npc = (ibuf.io.pc.asSInt + ImmGen(IMM_UJ, id_inst(0))).asUInt
 
   val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls, tile.roccCSRs.flatten, tile.rocketParams.beuAddr.isDefined))
+  val customCSRs = Wire(new RocketCustomCSRs)
+  io.systolic_master_ctrl := customCSRs.systolicMasterCtrl
+  io.systolic_data_out    := customCSRs.systolicDataOut
+  io.systolic_data_wen    := customCSRs.systolicDataWen
+
+  // Wire custom CSR hardware interactions
+  (customCSRs.csrs zip csr.io.customCSRs zip coreParams.customCSRs.decls) foreach { case ((lhs, rhs), decl) =>
+    lhs.value := rhs.value
+    lhs.ren   := rhs.ren
+    lhs.wen   := rhs.wen
+    lhs.wdata := rhs.wdata
+    
+    if (decl.id == 0x801) {
+      rhs.sdata := io.systolic_opA
+      rhs.set := true.B // Always reflect mesh data on read
+      rhs.stall := false.B
+      
+      lhs.stall := false.B
+      lhs.set := false.B
+      lhs.sdata := 0.U
+    } else {
+      lhs.stall := false.B
+      lhs.set   := false.B
+      lhs.sdata := 0.U
+
+      rhs.stall := false.B
+      rhs.set := false.B
+      rhs.sdata := 0.U
+    }
+  }
+
   val id_csr_en = id_ctrl.csr.isOneOf(CSR.S, CSR.C, CSR.W)
   val id_system_insn = id_ctrl.csr === CSR.I
   val id_csr_ren = id_ctrl.csr.isOneOf(CSR.S, CSR.C) && id_expanded_inst(0).rs1 === 0.U
@@ -469,13 +524,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     yield Mux(ex_reg_rs_bypass(i), bypass_mux(ex_reg_rs_lsb(i)), Cat(ex_reg_rs_msb(i), ex_reg_rs_lsb(i)))
   val ex_imm = ImmGen(ex_ctrl.sel_imm, ex_reg_inst)
   val ex_rs1shl = Mux(ex_reg_inst(3), ex_rs(0)(31,0), ex_rs(0)) << ex_reg_inst(14,13)
-  val ex_op1 = MuxLookup(ex_ctrl.sel_alu1, 0.S)(Seq(
+  val ex_op1_normal = MuxLookup(ex_ctrl.sel_alu1, 0.S)(Seq(
     A1_RS1 -> ex_rs(0).asSInt,
     A1_PC -> ex_reg_pc.asSInt,
     A1_RS1SHL -> (if (rocketParams.useZba) ex_rs1shl.asSInt else 0.S)
   ))
+  val ex_op1 = Mux(io.systolic_enable, io.systolic_opA.asSInt, ex_op1_normal)
+
   val ex_op2_oh = UIntToOH(Mux(ex_ctrl.sel_alu2(0), (ex_reg_inst >> 20).asUInt, ex_rs(1))(log2Ceil(xLen)-1,0)).asSInt
-  val ex_op2 = MuxLookup(ex_ctrl.sel_alu2, 0.S)(Seq(
+  val ex_op2_normal = MuxLookup(ex_ctrl.sel_alu2, 0.S)(Seq(
     A2_RS2 -> ex_rs(1).asSInt,
     A2_IMM -> ex_imm,
     A2_SIZE -> Mux(ex_reg_rvc, 2.S, 4.S),
@@ -483,6 +540,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     A2_RS2OH -> ex_op2_oh,
     A2_IMMOH -> ex_op2_oh,
   ) else Nil))
+  val ex_op2 = Mux(io.systolic_enable, io.systolic_opB.asSInt, ex_op2_normal)
+
 
   val (ex_new_vl, ex_new_vconfig) = if (usingVector) {
     val ex_new_vtype = VType.fromUInt(MuxCase(ex_rs(1), Seq(
