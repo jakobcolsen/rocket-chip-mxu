@@ -10,6 +10,9 @@ import chisel3.util._
 import org.chipsalliance.cde.config._
 import org.chipsalliance.diplomacy.lazymodule._
 
+
+case object SystolicEnabledKey extends Field[Boolean](false)
+
 import freechips.rocketchip.devices.tilelink.{BasicBusBlockerParams, BasicBusBlocker}
 import freechips.rocketchip.diplomacy.{
   AddressSet, DisableMonitors, BufferParams, BundleBridgeSource, BundleBridgeSink, BundleBridgeNode
@@ -132,7 +135,9 @@ class RocketTile private(
 
   override lazy val module = new RocketTileModuleImp(this)
 
-  val systolic_node = BundleBridgeSink[SystolicBundle]()
+  // Separate BundleBridges for Input and Output to avoid bidirectional confusion
+  val systolic_in_node  = if (p(SystolicEnabledKey)) Some(BundleBridgeSink[SystolicInputBundle]()) else None
+  val systolic_out_node = if (p(SystolicEnabledKey)) Some(BundleBridgeSource(() => new SystolicOutputBundle)) else None
 
   override def makeMasterBoundaryBuffers(crossing: ClockCrossingType)(implicit p: Parameters) = (rocketParams.boundaryBuffers, crossing) match {
     case (Some(RocketTileBoundaryBufferParams(true )), _)                   => TLBuffer()
@@ -153,33 +158,57 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     with HasICacheFrontendModule {
   Annotated.params(this, outer.rocketParams)
 
-  // Systolic IO via Diplomacy
-  val systolic_io = outer.systolic_node.bundle
-
   val core = Module(new Rocket(outer)(outer.p))
-  systolic_io.systolic_master_ctrl := core.io.systolic_master_ctrl
 
-  // --- Systolic Mesh Interface Integration ---
-  val systolic_if = Module(new SystolicInterface()(outer.p))
-  
-  // 1. Wire to External Mesh (Diplomatic IOs)
-  systolic_if.io.west_in          <> systolic_io.west_in
-  systolic_if.io.north_in         <> systolic_io.north_in
-  systolic_io.east_out            <> systolic_if.io.east_out
-  systolic_io.south_out           <> systolic_if.io.south_out
-  systolic_if.io.systolic_enable := systolic_io.systolic_enable
-  systolic_if.io.systolic_stall  := systolic_io.systolic_stall
+  if (outer.systolic_in_node.isDefined && outer.systolic_out_node.isDefined) {
+      val systolic_in_io  = outer.systolic_in_node.get.bundle
+      val systolic_out_io = outer.systolic_out_node.get.bundle
 
-  // 2. Wire to Internal Core Pipeline
-  core.io.systolic_opA          := systolic_if.io.alu_opA
-  core.io.systolic_opB          := systolic_if.io.alu_opB
-  core.io.systolic_enable       := systolic_io.systolic_enable
-  core.io.systolic_stall        := systolic_io.systolic_stall
-  systolic_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+      systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
 
-  // 3. Wire Core Data Injection (For Software Mesh Control)
-  systolic_if.io.core_data_in   := core.io.systolic_data_out
-  systolic_if.io.core_data_wen  := core.io.systolic_data_wen
+      // --- Systolic Mesh Interface Integration ---
+      val systolic_if = Module(new SystolicInterface()(outer.p))
+      
+      // 1. Wire to External Mesh (Diplomatic IOs)
+      // Inputs from Mesh -> Interface
+      systolic_if.io.west_in          <> systolic_in_io.west_in
+      systolic_if.io.north_in         <> systolic_in_io.north_in
+      systolic_if.io.systolic_enable  := systolic_in_io.systolic_enable
+      systolic_if.io.systolic_stall   := systolic_in_io.systolic_stall
+
+      // Outputs from Interface -> Mesh
+      systolic_out_io.east_out        <> systolic_if.io.east_out
+      systolic_out_io.south_out       <> systolic_if.io.south_out
+      systolic_out_io.instruction     := systolic_if.io.instruction_out
+      systolic_out_io.instruction_valid := systolic_if.io.instruction_valid_out
+      
+      // 2. Wire to Internal Core Pipeline
+      core.io.systolic_opA          := systolic_if.io.alu_opA
+      core.io.systolic_opB          := systolic_if.io.alu_opB
+      core.io.systolic_enable       := systolic_in_io.systolic_enable
+      core.io.systolic_stall        := systolic_in_io.systolic_stall
+      systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+      
+      // Wire Instruction Broadcast Logic
+      systolic_if.io.core_inst_out       := core.io.systolic_instruction_out
+      systolic_if.io.core_inst_valid_out := core.io.systolic_instruction_valid_out
+      systolic_if.io.instruction_in       := systolic_in_io.instruction
+      systolic_if.io.instruction_valid_in := systolic_in_io.instruction_valid
+      core.io.systolic_instruction_in     := systolic_if.io.core_inst_in
+      core.io.systolic_instruction_valid_in := systolic_if.io.core_inst_valid_in
+
+      // 3. Wire Core Data Injection (For Software Mesh Control)
+      systolic_if.io.core_data_in   := core.io.systolic_data_out
+      systolic_if.io.core_data_wen  := core.io.systolic_data_wen
+  } else {
+      // Tie off core systolic ports if needed, or leave disconnected if strictly input
+      core.io.systolic_enable := false.B
+      core.io.systolic_stall  := false.B
+      core.io.systolic_opA    := 0.U
+      core.io.systolic_opB    := 0.U
+      core.io.systolic_instruction_in := 0.U
+      core.io.systolic_instruction_valid_in := false.B
+  }
 
   outer.vector_unit.foreach { v =>
     core.io.vector.get <> v.module.io.core
@@ -187,7 +216,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
   }
 
   // reset vector is connected in the Frontend to s2_pc
-  core.io.reset_vector := DontCare
+  core.io.reset_vector := outer.resetVectorSinkNode.bundle
 
   // Report unrecoverable error conditions; for now the only cause is cache ECC errors
   outer.reportHalt(List(outer.dcache.module.io.errors))

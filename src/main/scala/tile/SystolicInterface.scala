@@ -5,14 +5,23 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import org.chipsalliance.diplomacy.bundlebridge.{BundleBridgeNode, BundleBridgeSource}
 
-class SystolicBundle(implicit p: Parameters) extends Bundle {
-  val west_in          = Decoupled(UInt(64.W))          // flows Mesh -> Tile
-  val east_out         = Flipped(Decoupled(UInt(64.W))) // flows Tile -> Mesh
-  val north_in         = Decoupled(UInt(64.W))          // flows Mesh -> Tile
-  val south_out        = Flipped(Decoupled(UInt(64.W))) // flows Tile -> Mesh
-  val systolic_enable  = Output(Bool())                 // flows Mesh -> Tile
-  val systolic_stall   = Output(Bool())                 // flows Mesh -> Tile
-  val systolic_master_ctrl = Input(Bool())              // flows Tile -> Mesh
+// Flows from Mesh Network -> Tile
+class SystolicInputBundle(implicit p: Parameters) extends Bundle {
+  val west_in          = Decoupled(UInt(64.W))
+  val north_in         = Decoupled(UInt(64.W))
+  val systolic_enable  = Bool()
+  val systolic_stall   = Bool()
+  val instruction      = UInt(32.W) // Instruction from Leader
+  val instruction_valid = Bool()     // Leader is executing
+}
+
+// Flows from Tile -> Mesh Network
+class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
+  val east_out         = Decoupled(UInt(64.W))
+  val south_out        = Decoupled(UInt(64.W))
+  val systolic_master_ctrl = Bool()
+  val instruction      = UInt(32.W) // Instruction from Leader
+  val instruction_valid = Bool()     // Leader is executing
 }
 
 class SystolicInterface(implicit p: Parameters) extends Module {
@@ -37,47 +46,76 @@ class SystolicInterface(implicit p: Parameters) extends Module {
     // Core Data Injection (for Software-driven Mesh)
     val core_data_in  = Input(UInt(64.W))
     val core_data_wen = Input(Bool())
+
+    // Instruction Broadcast
+    val instruction_out = Output(UInt(32.W)) // To Mesh (Leader)
+    val instruction_valid_out = Output(Bool()) // To Mesh (Leader)
+    val instruction_in  = Input(UInt(32.W))  // From Mesh (Follower)
+    val instruction_valid_in = Input(Bool()) // From Mesh (Follower)
+    val core_inst_out   = Input(UInt(32.W))  // From Core (Leader Source)
+    val core_inst_valid_out = Input(Bool())  // From Core (Leader Source)
+    val core_inst_in    = Output(UInt(32.W)) // To Core (Follower)
+    val core_inst_valid_in = Output(Bool()) // To Core (Follower)
   })
 
   // ------------------------------------------------------------------------
-  // SIMPLIFIED PASS-THROUGH LOGIC (No Buffers for MVP)
+  // Proper Decoupled Handshaking Logic
   // ------------------------------------------------------------------------
   
-  // Pipeline Registers
-  val reg_a = RegInit(0.U(64.W))
-  val reg_b = RegInit(0.U(64.W))
-  val reg_valid_a = RegInit(false.B)
-  val reg_valid_b = RegInit(false.B)
+  // Design Choice: Use 1-entry Queues (skid buffers) to break combinational paths
+  // and handle ready/valid clean-up.
+  
+  val q_west  = Module(new Queue(UInt(64.W), 1))
+  val q_north = Module(new Queue(UInt(64.W), 1))
+  
+  // Inputs feed into queues
+  q_west.io.enq.valid := io.west_in.valid
+  q_west.io.enq.bits  := io.west_in.bits
+  io.west_in.ready    := q_west.io.enq.ready
+  
+  q_north.io.enq.valid := io.north_in.valid
+  q_north.io.enq.bits  := io.north_in.bits
+  io.north_in.ready    := q_north.io.enq.ready
+  
+  // Pipeline Registers / State
+  // We only consume from queues if we can output OR if we are just latching internal ops
+  // For this simple systolic node, we forward inputs -> outputs.
+  
+  // 1. Data Injection Override
+  // If core writes, it takes priority and behaves like a "valid" input source
+  val injected_a = io.core_data_wen && io.systolic_enable
+  val source_a_valid = q_west.io.deq.valid || injected_a
+  val source_a_bits  = Mux(injected_a, io.core_data_in, q_west.io.deq.bits)
+  
+  // 2. Output Logic (East)
+  // We forward A (West/Core) -> East
+  io.east_out.valid := source_a_valid && !io.systolic_stall
+  io.east_out.bits  := source_a_bits
+  
+  // We consume West if we are running and either logic injected (fake consumption) or East accepted
+  // Note: core injection doesn't pop West queue, it overrides it.
+  q_west.io.deq.ready := !injected_a && io.east_out.ready && !io.systolic_stall
 
-  // Handshaking Logic
-  // For MVP, we assume "Always Ready" if enabled, to synchronize lockstep.
-  // In a real flow control, we'd check downstream ready.
+  // 3. Output Logic (South)
+  // We forward B (North) -> South
+  io.south_out.valid := q_north.io.deq.valid && !io.systolic_stall
+  io.south_out.bits  := q_north.io.deq.bits
   
-  io.west_in.ready := true.B
-  io.north_in.ready := true.B
+  q_north.io.deq.ready := io.south_out.ready && !io.systolic_stall
   
-  when (io.core_data_wen) {
-    reg_a := io.core_data_in
-    reg_valid_a := true.B
-  } .elsewhen (io.west_in.valid) {
-    reg_a := io.west_in.bits
-    reg_valid_a := true.B
-  }
-  
-  when (io.north_in.valid) {
-    reg_b := io.north_in.bits
-    reg_valid_b := true.B
-  }
-  
-  // Drive Outputs
-  io.east_out.valid := reg_valid_a // Simple forward
-  io.east_out.bits  := reg_a
-  
-  io.south_out.valid := reg_valid_b
-  io.south_out.bits  := reg_b
-  
-  // Drive Core ALU
-  io.alu_opA := reg_a
-  io.alu_opB := reg_b
+  // 4. Drive Core ALU
+  // We snoop the data being passed through.
+  // Ideally, this should be latched when the handshake happens.
+  // For now, asynchronous snoop of the data presented to outputs.
+  io.alu_opA := source_a_bits
+  io.alu_opB := q_north.io.deq.bits
 
+  // 5. Instruction Broadcast Logic
+  // Leader: instruction_out = core_inst_out (from IB/Core)
+  io.instruction_out       := io.core_inst_out
+  io.instruction_valid_out := io.core_inst_valid_out
+
+  // Follower: core_inst_in = instruction_in (from Mesh)
+  io.core_inst_in          := io.instruction_in
+  io.core_inst_valid_in    := io.instruction_valid_in
 }

@@ -22,7 +22,8 @@ case class BootROMParams(
   address: BigInt = 0x10000,
   size: Int = 0x10000,
   hang: BigInt = 0x10040, // The hang parameter is used as the power-on reset vector
-  contentFileName: String)
+  contentFileName: String,
+  driveResetVector: Boolean = true)
 
 class TLROM(val base: BigInt, val size: Int, contentsDelayed: => Seq[Byte], executable: Boolean = true, beatBytes: Int = 4,
   resources: Seq[Resource] = new SimpleDevice("rom", Seq("sifive,rom0")).reg("mem"))(implicit p: Parameters) extends LazyModule
@@ -88,12 +89,14 @@ object BootROM {
 
     bootrom.node := tlbus.coupleTo("bootrom"){ TLFragmenter(tlbus, Some("BootROM")) := _ }
     // Drive the `subsystem` reset vector to the `hang` address of this Boot ROM.
-    subsystem.tileResetVectorNexusNode := bootROMResetVectorSourceNode
-    InModuleBody {
-      val reset_vector_source = bootROMResetVectorSourceNode.bundle
-      require(reset_vector_source.getWidth >= params.hang.bitLength,
-        s"BootROM defined with a reset vector (${params.hang})too large for physical address space (${reset_vector_source.getWidth})")
-      bootROMResetVectorSourceNode.bundle := params.hang.U
+    if (params.driveResetVector) {
+      subsystem.tileResetVectorNexusNode := bootROMResetVectorSourceNode
+      InModuleBody {
+        val reset_vector_source = bootROMResetVectorSourceNode.bundle
+        require(reset_vector_source.getWidth >= params.hang.bitLength,
+          s"BootROM defined with a reset vector (${params.hang})too large for physical address space (${reset_vector_source.getWidth})")
+        bootROMResetVectorSourceNode.bundle := params.hang.U
+      }
     }
     bootrom
   }

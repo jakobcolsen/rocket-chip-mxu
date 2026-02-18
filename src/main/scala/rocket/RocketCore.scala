@@ -122,12 +122,13 @@ class RocketCustomCSRs(implicit p: Parameters) extends CustomCSRs with HasRocket
   def mimpid = CustomCSR.constant(CSRs.mimpid, BigInt(rocketParams.mimpid))
 
   // Systolic Control CSR (Head Node Control)
-  def systolicCSR = CustomCSR(0x800, BigInt(1), Some(BigInt(0))) // Address 0x800, Bit 0 writable
+  def systolicCSR = CustomCSR(0x800, BigInt(3), Some(BigInt(0))) // Address 0x800, Bit 0 & 1 writable
 
   // Systolic Data CSR (Data Exchange)
   def systolicDataCSR = CustomCSR(0x801, BigInt(0), Some(BigInt(0)))
 
   def systolicMasterCtrl = getByIdOrElse(0x800, _.value(0), false.B)
+  def systolicSimdMode   = getByIdOrElse(0x800, _.value(1), false.B)
   def systolicDataOut    = getByIdOrElse(0x801, _.wdata, 0.U)
   def systolicDataWen    = getByIdOrElse(0x801, _.wen, false.B)
 
@@ -158,14 +159,20 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val traceStall = Input(Bool())
     val vector = if (usingVector) Some(Flipped(new VectorCoreIO)) else None
     
-    // Systolic Interface (Simplified)
-    val systolic_opA = Input(UInt(xLen.W))
-    val systolic_opB = Input(UInt(xLen.W))
-    val systolic_enable = Input(Bool())
-    val systolic_stall = Input(Bool())
+    // Systolic Interface (Instruction Broadcast)
+    val systolic_instruction_in       = Input(UInt(32.W))
+    val systolic_instruction_valid_in = Input(Bool())
+    val systolic_instruction_out      = Output(UInt(32.W))
+    val systolic_instruction_valid_out = Output(Bool())
+
+    // Systolic Control/Data
+    val systolic_stall       = Input(Bool())
+    val systolic_enable      = Input(Bool())
+    val systolic_opA         = Input(UInt(xLen.W))
+    val systolic_opB         = Input(UInt(xLen.W))
     val systolic_master_ctrl = Output(Bool())
-    val systolic_data_out = Output(UInt(xLen.W))
-    val systolic_data_wen = Output(Bool())
+    val systolic_data_out    = Output(UInt(xLen.W))
+    val systolic_data_wen    = Output(Bool())
 
 
   })
@@ -181,12 +188,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val clock_en_reg = RegInit(true.B)
   val long_latency_stall = Reg(Bool())
   val id_reg_pause = Reg(Bool())
-  val imem_might_request_reg = Reg(Bool())
-  val clock_en = WireDefault(true.B)
-  when (io.systolic_stall && !reset.asBool) { clock_en := false.B }
+  val imem_might_request_reg = RegInit(true.B)
+  val clock_en = WireInit(true.B)
 
   val gated_clock =
-    if (!rocketParams.clockGate) clock
+    if (true) clock
     else ClockGate(clock, clock_en, "rocket_clock_gate")
 
   class RocketImpl { // entering gated-clock domain
@@ -311,12 +317,12 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   val wb_reg_valid           = Reg(Bool())
   val wb_reg_xcpt            = Reg(Bool())
-  val wb_reg_replay          = Reg(Bool())
+  val wb_reg_replay          = RegInit(true.B)
   val wb_reg_flush_pipe      = Reg(Bool())
   val wb_reg_cause           = Reg(UInt())
   val wb_reg_set_vconfig     = Reg(Bool())
   val wb_reg_sfence = Reg(Bool())
-  val wb_reg_pc = Reg(UInt())
+  val wb_reg_pc = RegInit(0x80000000L.U)
   val wb_reg_mem_size = Reg(UInt())
   val wb_reg_hls_or_dv = Reg(Bool())
   val wb_reg_hfence_v = Reg(Bool())
@@ -333,25 +339,38 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // decode stage
   val ibuf = Module(new IBuf)
+  ibuf.io.imem <> io.imem.resp
+  ibuf.io.kill := take_pc
   val id_expanded_inst = ibuf.io.inst.map(_.bits.inst)
   val id_raw_inst = ibuf.io.inst.map(_.bits.raw)
   val id_inst = id_expanded_inst.map(_.bits)
-  ibuf.io.imem <> io.imem.resp
-  ibuf.io.kill := take_pc
+  
+  // --- Systolic Hardware State ---
+  val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls, tile.roccCSRs.flatten, tile.rocketParams.beuAddr.isDefined))
+  val customCSRs = Wire(new RocketCustomCSRs)
+  io.systolic_master_ctrl := customCSRs.systolicMasterCtrl
+  io.systolic_data_out    := customCSRs.systolicDataOut
+  io.systolic_data_wen    := customCSRs.systolicDataWen
+
+  val is_leader = io.hartid === 0.U
+  val id_effective_inst = Mux(customCSRs.systolicSimdMode && !is_leader, io.systolic_instruction_in, id_inst(0))
+  val id_effective_valid = Mux(customCSRs.systolicSimdMode && !is_leader, io.systolic_instruction_valid_in, ibuf.io.inst(0).valid)
 
   require(decodeWidth == 1 /* TODO */ && retireWidth == decodeWidth)
   require(!(coreParams.useRVE && coreParams.fpu.nonEmpty), "Can't select both RVE and floating-point")
   require(!(coreParams.useRVE && coreParams.useHypervisor), "Can't select both RVE and Hypervisor")
-  val id_ctrl = Wire(new IntCtrlSigs).decode(id_inst(0), decode_table)
+  val id_ctrl = Wire(new IntCtrlSigs).decode(id_effective_inst, decode_table)
 
   val lgNXRegs = if (coreParams.useRVE) 4 else 5
   val regAddrMask = (1 << lgNXRegs) - 1
 
+
   def decodeReg(x: UInt) = (x.extract(x.getWidth-1, lgNXRegs).asBool, x(lgNXRegs-1, 0))
-  val (id_raddr3_illegal, id_raddr3) = decodeReg(id_expanded_inst(0).rs3)
-  val (id_raddr2_illegal, id_raddr2) = decodeReg(id_expanded_inst(0).rs2)
-  val (id_raddr1_illegal, id_raddr1) = decodeReg(id_expanded_inst(0).rs1)
-  val (id_waddr_illegal,  id_waddr)  = decodeReg(id_expanded_inst(0).rd)
+  val effective_expanded_inst = id_effective_inst.asTypeOf(new ExpandedInstruction)
+  val (id_raddr3_illegal, id_raddr3) = decodeReg(effective_expanded_inst.rs3)
+  val (id_raddr2_illegal, id_raddr2) = decodeReg(effective_expanded_inst.rs2)
+  val (id_raddr1_illegal, id_raddr1) = decodeReg(effective_expanded_inst.rs1)
+  val (id_waddr_illegal,  id_waddr)  = decodeReg(effective_expanded_inst.rd)
 
   val id_load_use = Wire(Bool())
   val id_reg_fence = RegInit(false.B)
@@ -360,13 +379,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val rf = new RegFile(regAddrMask, xLen)
   val id_rs = id_raddr.map(rf.read _)
   val ctrl_killd = Wire(Bool())
-  val id_npc = (ibuf.io.pc.asSInt + ImmGen(IMM_UJ, id_inst(0))).asUInt
+  val id_npc = (ibuf.io.pc.asSInt + ImmGen(IMM_UJ, id_effective_inst)).asUInt
 
-  val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls, tile.roccCSRs.flatten, tile.rocketParams.beuAddr.isDefined))
-  val customCSRs = Wire(new RocketCustomCSRs)
-  io.systolic_master_ctrl := customCSRs.systolicMasterCtrl
-  io.systolic_data_out    := customCSRs.systolicDataOut
-  io.systolic_data_wen    := customCSRs.systolicDataWen
 
   // Wire custom CSR hardware interactions
   (customCSRs.csrs zip csr.io.customCSRs zip coreParams.customCSRs.decls) foreach { case ((lhs, rhs), decl) =>
@@ -529,7 +543,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     A1_PC -> ex_reg_pc.asSInt,
     A1_RS1SHL -> (if (rocketParams.useZba) ex_rs1shl.asSInt else 0.S)
   ))
-  val ex_op1 = Mux(io.systolic_enable, io.systolic_opA.asSInt, ex_op1_normal)
+  val ex_op1 = Mux(io.systolic_enable && customCSRs.systolicSimdMode, io.systolic_opA.asSInt, ex_op1_normal)
 
   val ex_op2_oh = UIntToOH(Mux(ex_ctrl.sel_alu2(0), (ex_reg_inst >> 20).asUInt, ex_rs(1))(log2Ceil(xLen)-1,0)).asSInt
   val ex_op2_normal = MuxLookup(ex_ctrl.sel_alu2, 0.S)(Seq(
@@ -540,7 +554,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     A2_RS2OH -> ex_op2_oh,
     A2_IMMOH -> ex_op2_oh,
   ) else Nil))
-  val ex_op2 = Mux(io.systolic_enable, io.systolic_opB.asSInt, ex_op2_normal)
+  val ex_op2 = Mux(io.systolic_enable && customCSRs.systolicSimdMode, io.systolic_opB.asSInt, ex_op2_normal)
 
 
   val (ex_new_vl, ex_new_vconfig) = if (usingVector) {
@@ -642,7 +656,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   }
   when (!ctrl_killd || csr.io.interrupt || ibuf.io.inst(0).bits.replay) {
     ex_reg_cause := id_cause
-    ex_reg_inst := id_inst(0)
+    ex_reg_inst := id_effective_inst
     ex_reg_raw_inst := id_raw_inst(0)
     ex_reg_pc := ibuf.io.pc
     ex_reg_btb_resp := ibuf.io.btb_resp
@@ -813,11 +827,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val wb_pc_valid = wb_reg_valid || wb_reg_replay || wb_reg_xcpt
   val wb_wxd = wb_reg_valid && wb_ctrl.wxd
   val wb_set_sboard = wb_ctrl.div || wb_dcache_miss || wb_ctrl.rocc || wb_ctrl.vec
-  val replay_wb_common = io.dmem.s2_nack || wb_reg_replay
+  val boot_request_reg = RegInit(50000.U(16.W))
+  when (boot_request_reg > 0.U) { boot_request_reg := boot_request_reg - 1.U }
+  val replay_wb_common = io.dmem.s2_nack || wb_reg_replay || (boot_request_reg > 49000.U) // 1000 cycle nudge
   val replay_wb_rocc = wb_reg_valid && wb_ctrl.rocc && !io.rocc.cmd.ready
   val replay_wb_csr: Bool = wb_reg_valid && csr.io.rw_stall
   val replay_wb_vec = wb_reg_valid && io.vector.map(_.wb.replay).getOrElse(false.B)
-  val replay_wb = replay_wb_common || replay_wb_rocc || replay_wb_csr || replay_wb_vec
+  val replay_wb = replay_wb_common || wb_reg_xcpt || wb_reg_flush_pipe || replay_wb_rocc || replay_wb_csr || replay_wb_vec
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
   // writeback arbitration
@@ -884,7 +900,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // hook up control/status regfile
   csr.io.ungated_clock := clock
-  csr.io.decode(0).inst := id_inst(0)
+  csr.io.decode(0).inst := id_effective_inst
   csr.io.exception := wb_xcpt
   csr.io.cause := wb_cause
   csr.io.retire := wb_valid
@@ -1102,7 +1118,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     csr.io.csr_stall ||
     id_reg_pause ||
     io.traceStall
-  ctrl_killd := !ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
+  ctrl_killd := !id_effective_valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -1112,7 +1128,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                                 mem_npc))    // flush or branch misprediction
   io.imem.flush_icache := wb_reg_valid && wb_ctrl.fence_i && !io.dmem.s2_nack
   io.imem.might_request := {
-    imem_might_request_reg := ex_pc_valid || mem_pc_valid || io.ptw.customCSRs.disableICacheClockGate || io.vector.map(_.trap_check_busy).getOrElse(false.B)
+    imem_might_request_reg := ex_pc_valid || mem_pc_valid || (boot_request_reg > 0.U) || io.ptw.customCSRs.disableICacheClockGate || io.vector.map(_.trap_check_busy).getOrElse(false.B)
     imem_might_request_reg
   }
   io.imem.progress := RegNext(wb_reg_valid && !replay_wb_common)
@@ -1125,7 +1141,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.imem.sfence.bits.hg := wb_reg_hfence_g
   io.ptw.sfence := io.imem.sfence
 
-  ibuf.io.inst(0).ready := !ctrl_stalld
+  ibuf.io.inst(0).ready := !ctrl_stalld && !(customCSRs.systolicSimdMode && !is_leader)
 
   io.imem.btb_update.valid := mem_reg_valid && !take_pc_wb && mem_wrong_npc && (!mem_cfi || mem_cfi_taken)
   io.imem.btb_update.bits.isValid := mem_cfi
@@ -1226,7 +1242,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.wfi := csr.io.status.wfi
   if (rocketParams.clockGate) {
     long_latency_stall := csr.io.csr_stall || io.dmem.perf.blocked || id_reg_pause && !unpause
-    clock_en := clock_en_reg || ex_pc_valid || (!long_latency_stall && io.imem.resp.valid)
+    clock_en := (clock_en_reg || ex_pc_valid || (!long_latency_stall && io.imem.resp.valid)) && !io.systolic_stall
     clock_en_reg :=
       ex_pc_valid || mem_pc_valid || wb_pc_valid || // instruction in flight
       io.ptw.customCSRs.disableCoreClockGate || // chicken bit
@@ -1289,6 +1305,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     }
   }
   else {
+    when (csr.io.time < 500.U || csr.io.time % 1000.U === 0.U) {
+      // when (io.hartid === 0.U) { // comment out hartid filter
+        printf("DEBUG HART%d: pc=%x clk_en=%d take_pc=%d req_v=%d req_pc=%x simd=%d stall=%d repl_wb=%d id_v=%d ibuf_v=%d ibuf_r=%d killd=%d resp_v=%d resp_data=%x boot_cnt=%d\n",
+          io.hartid, ibuf.io.pc, clock_en, take_pc, io.imem.req.valid, io.imem.req.bits.pc, customCSRs.systolicSimdMode, io.systolic_stall, replay_wb,
+          id_effective_valid, ibuf.io.inst(0).valid, ibuf.io.inst(0).ready, ctrl_killd, io.imem.resp.valid, io.imem.resp.bits.data, boot_request_reg)
+      // }
+    }
     when (csr.io.trace(0).valid) {
       printf("C%d: %d [%d] pc=[%x] W[r%d=%x][%d] R[r%d=%x] R[r%d=%x] inst=[%x] DASM(%x)\n",
          io.hartid, coreMonitorBundle.timer, coreMonitorBundle.valid,
@@ -1329,6 +1352,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     name = "max_core_cycles",
     docstring = "Kill the emulation after INT rdtime cycles. Off if 0."
   )(csr.io.time)
+
+    // Instruction Broadcast Export
+    io.systolic_instruction_out := id_inst(0)
+    io.systolic_instruction_valid_out := is_leader && !ctrl_killd
 
   } // leaving gated-clock domain
   val rocketImpl = withClock (gated_clock) { new RocketImpl }

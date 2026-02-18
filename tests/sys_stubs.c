@@ -43,6 +43,3 @@ off_t _lseek(int file, off_t ptr, int dir) {
   return 0;
 }
 
-void handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
-    while(1);
-}

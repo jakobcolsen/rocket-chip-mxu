@@ -15,3 +15,28 @@ docs-target/
 rocketchip.jar
 *#
 .#*
+
+# Compilation Artifacts
+*.o
+*.d
+*.riscv
+*.hex
+*.dump
+
+# Logs and Simulation Files
+*.log
+*.out
+*.vpd
+*.vcd
+uart_output.txt
+
+# Specific temporary files
+sim_trace*.log
+simd_*.log
+compilation_*.log
+main_dump.txt
+
+# Misc
+simulator
+*.dis
+*.baremetal_bkp
