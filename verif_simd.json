@@ -1,0 +1,8 @@
+{
+    "name": "verif_simd",
+    "distro": {
+        "name": "bare",
+        "opts": {}
+    },
+    "bin": "/home/jolsen16/rocket-chip-mxu/tests/verif_simd.riscv"
+}

@@ -164,7 +164,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       val systolic_in_io  = outer.systolic_in_node.get.bundle
       val systolic_out_io = outer.systolic_out_node.get.bundle
 
-      systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+      // systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl // Redundant with line 190
 
       // --- Systolic Mesh Interface Integration ---
       val systolic_if = Module(new SystolicInterface()(outer.p))
@@ -188,6 +188,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_enable       := systolic_in_io.systolic_enable
       core.io.systolic_stall        := systolic_in_io.systolic_stall
       systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
+      systolic_out_io.systolic_simd_mode   := core.io.systolic_simd_mode_out
       
       // Wire Instruction Broadcast Logic
       systolic_if.io.core_inst_out       := core.io.systolic_instruction_out

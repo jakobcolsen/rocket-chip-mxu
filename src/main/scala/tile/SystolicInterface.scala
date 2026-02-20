@@ -20,6 +20,7 @@ class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
   val east_out         = Decoupled(UInt(64.W))
   val south_out        = Decoupled(UInt(64.W))
   val systolic_master_ctrl = Bool()
+  val systolic_simd_mode   = Bool() // Broadcast Leader Mode
   val instruction      = UInt(32.W) // Instruction from Leader
   val instruction_valid = Bool()     // Leader is executing
 }
@@ -108,7 +109,7 @@ class SystolicInterface(implicit p: Parameters) extends Module {
   // Ideally, this should be latched when the handshake happens.
   // For now, asynchronous snoop of the data presented to outputs.
   io.alu_opA := source_a_bits
-  io.alu_opB := q_north.io.deq.bits
+  io.alu_opB := Mux(q_north.io.deq.valid, q_north.io.deq.bits, 0.U)
 
   // 5. Instruction Broadcast Logic
   // Leader: instruction_out = core_inst_out (from IB/Core)
