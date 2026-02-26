@@ -193,22 +193,41 @@ How does Core 1 know it should stop running its own code and listen to Core 0?
 val is_leader = io.hartid === 0.U
 val id_systolic_follower = io.systolic_enable && !is_leader
 ```
-- **What it does:** Calculates if the current CPU is a follower. Note the hardcoded `hartid === 0.U`. This means Tile 0 can NEVER be a follower. If `systolic_enable` (which comes from `0x800` on Tile 0 via the Mesh) is high, every core *except* Core 0 flips into "Follower Mode".
+- **What it does:** Calculates if the current CPU is a follower. Note the hardcoded `hartid === 0.U`. This means Tile 0 can NEVER be a follower. `io.systolic_enable` is the **globally-broadcast** signal driven from Core 0's CSR `0x800` via the Mesh. When the Leader writes `2` to CSR `0x800`, the Mesh fans this signal to all tiles, and every core *except* Core 0 flips into "Follower Mode".
 
-### C. Hijacking the Instruction Buffer (Fetch / Decode)
-Normally, instructions come from the Instruction Fetch stage (the `ibuf`). 
+> [!IMPORTANT]
+> An earlier version of this logic also checked the follower's **local** `customCSRs.systolicSimdMode`. This was a critical bug: since only the Leader writes CSR `0x800`, followers' local CSR was never set, and they never entered SIMD mode. The fix uses `io.systolic_enable` (the globally-broadcast version) exclusively.
+
+### C. Follower-Fetch: Hijacking the Instruction & PC (Fetch / Decode)
+Normally, instructions come from the Instruction Fetch stage (the `ibuf`) based on the local Program Counter. 
 ```scala
 val id_effective_inst = Mux(id_systolic_follower, io.systolic_instruction_in, id_inst(0))
 val id_effective_valid = Mux(id_systolic_follower, io.systolic_instruction_valid_in, ibuf.io.inst(0).valid)
+val id_effective_pc = Mux(id_systolic_follower, io.systolic_pc_in, ibuf.io.pc)
 ```
-- **What it does:** This is the most crucial hack in the codebase. Inside the **Decode (ID)** stage, we create an `id_effective_inst` multiplexer. If the core is a follower, it completely ignores the instruction fetched by its local Program Counter (`id_inst(0)`) and blindly feeds the pipeline whatever 32-bit `systolic_instruction_in` is being broadcasted over the mesh from Core 0. 
+- **What it does:** This is the most crucial architectural change. Inside the **Decode (ID)** stage, we create `id_effective_inst` and `id_effective_pc` multiplexers. If the core is a follower, it completely ignores the instruction and PC fetched by its local Instruction Fetch unit, and blindly feeds the pipeline the 32-bit instruction and 64-bit PC being broadcast over the 2D mesh from Core 0. This ensures `mepc` accurately tracks the SIMD payload during exceptions.
 
 ```scala
-ibuf.io.inst(0).ready := !ctrl_stalld && !(customCSRs.systolicSimdMode && !is_leader)
+ibuf.io.inst(0).ready := !ctrl_stalld && !id_systolic_follower
 ```
-- **What it does:** It tells the **Instruction Fetch (IF)** unit: "Hey, do NOT pop the next instruction off the cache queue." This freezes the Follower's local Program Counter (PC) safely in place while the downstream pipeline digests the injected SIMD instructions.
+- **What it does:** It tells the Follower's **Instruction Fetch (IF)** unit: "Hey, do NOT pop the next instruction off the cache queue." This freezes the Follower's local Program Counter safely in place (allowing it to resume standard execution later) while the downstream pipeline digests the injected SIMD instructions using `id_effective_pc`.
 
-### D. Pipeline Control and Safety Overrides
+### D. Constrained SIMD Masking (Branches, Jumps, and AMOs)
+Because followers blindly execute whatever the Leader broadcasts, they cannot evaluate their own control flow. If a follower tried to take a branch that the Leader didn't, it would fall out of lockstep and corrupt its pipeline state.
+
+```scala
+  when (id_systolic_follower) {
+    id_ctrl.branch := false.B
+    id_ctrl.jal := false.B
+    id_ctrl.jalr := false.B
+    id_ctrl.amo := false.B
+    // ...
+  }
+```
+- **What it does**: This logic forcefully blinds Followers to all complex control logic while in SIMD mode. 
+- **Consequences**: By killing branches, Follower cores are physically incapable of deviating from the Leader's execution path. They evaluate the math inside `if` statements but discard the jump. Furthermore, by killing `amo` (Atomic Memory Operations), followers cannot acquire hardware locks. This creates a **Pure Compute** SIMD model: all branching, locking, and synchronization must occur in standard MIMD mode, while the SIMD region is restricted to unrolled, branchless math kernels.
+
+### E. Pipeline Control and Safety Overrides
 When injecting foreign instructions into a pipeline, things can go disastrously wrong if you don't suppress local safety checks.
 ```scala
 val id_xcpt = Mux(id_systolic_follower, false.B, id_xcpt_raw)
@@ -216,30 +235,83 @@ val id_xcpt = Mux(id_systolic_follower, false.B, id_xcpt_raw)
 - **What it does:** If an instruction comes from Core 0, the local cache might throw an exception (e.g., page fault). We explicitly mask off (`false.B`) any decode exceptions thrown by the local follower because we aren't executing the local instruction anyway!
 
 ```scala
-val ex_op1 = Mux(io.systolic_enable && customCSRs.systolicSimdMode && !is_leader, io.systolic_opA.asSInt, ex_op1_normal)
+val ex_op1 = ex_op1_normal // [Fix B] Let followers use local registers for normal instructions
+val ex_op2 = ex_op2_normal // [Fix B] Let followers use local registers for normal instructions
 ```
-- **What it does:** In the **Execute (EX)** stage, if SIMD mode is active, the ALU inputs (`op1` and `op2`) are hijacked. Instead of reading from the CPU register file (e.g., register `t0`), the inputs are hard-wired to read from the East-West and North-South flows passing through the `SystolicInterface`. 
+- **What it does:** In the **Execute (EX)** stage, standard SIMD architectures often override `op1` and `op2` to inject mesh data. However, we discovered this breaks the execution of dynamic payload addresses (like calculating unique array offsets). Followers must continue to use their own local Register Files (`ex_op1_normal`) to compute unique memory offsets and mathematically diverge their data paths while executing the locked instruction stream.
 
-### E. Masking Replays & Kills
+### F. Masking Replays & Kills
 ```scala
 ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 ```
 - **What it does:** The standard Rocket Chip will "kill" an instruction (flush it from the pipeline) if the Instruction Buffer marks it for "replay" (meaning the cache wasn't ready). Because Followers freeze their `ibuf`, it often stays in a "replay" state eternally. The added `&& !id_systolic_follower` ensures that Followers ignore their local freeze state and execute the broadcasted instruction anyway.
 
-### F. Broadcasting from the Leader
+### G. Broadcasting from the Leader
 ```scala
 io.systolic_instruction_out := id_inst(0)
 io.systolic_instruction_valid_out := is_leader && !ctrl_killd
+io.systolic_pc_out := ibuf.io.pc
 ```
-- **What it does:** At the very bottom of the core file, we wire the outputs. Core 0 (`is_leader`) takes the instruction currently in its decode stage (`id_inst(0)`) and sends it out to the Mesh (`systolic_instruction_out`). It is only flagged as `valid` if it wasn't killed by a stall or branch misprediction (`!ctrl_killd`).
+- **What it does:** At the very bottom of the core file, we wire the outputs. Core 0 (`is_leader`) takes the instruction currently in its decode stage (`id_inst(0)`) and sends it out to the Mesh (`systolic_instruction_out`) alongside its active PC (`systolic_pc_out`). It is only flagged as `valid` if it wasn't killed by a stall or branch misprediction (`!ctrl_killd`).
 
 ---
 
 ## 🚀 Summary of the Data Flow
-1. **Core 0 (Leader)** boots up and writes `3` to CSR `0x800`.
+1. **Core 0 (Leader)** boots up and writes `2` to CSR `0x800` (bit 1 = SIMD mode).
 2. This sets `systolicSimdMode` to high in Core 0's hardware.
-3. This signal propagates out through `RocketTile` -> `SystolicMesh`, hitting all other cores.
-4. **Cores 1-15 (Followers)** receive this signal, evaluate `id_systolic_follower = true`, freeze their local instruction caches (`ibuf.ready = false`), and mask their local exceptions.
-5. **Core 0** executes an instruction (e.g., `add t0, t1, t2`).
-6. As that instruction passes through Core 0's **Decode** stage, it is broadcast out onto the mesh.
-7. **Cores 1-15** receive the instruction through `id_effective_inst` and execute it precisely in lock-step, utilizing data flowing dynamically through the `SystolicInterface` queues rather than their local register files.
+3. This signal propagates out through `RocketTile` → `SystolicMesh` as `systolic_simd_mode`, hitting all other tiles as `systolic_enable`.
+4. **Cores 1-3 (Followers)** receive this signal, evaluate `id_systolic_follower = io.systolic_enable && !is_leader = true`, freeze their local instruction caches (`ibuf.ready = false`), and mask their local exceptions.
+5. **Core 0** executes an instruction (e.g., `sb t2, 0(t1)`).
+6. As that instruction passes through Core 0's **Decode** stage, it is broadcast out onto the mesh via `systolic_instruction_out`.
+7. **Cores 1-3** receive the instruction through `id_effective_inst` and execute it precisely in lock-step. Each core reads its own `mhartid` and computes a unique store address, proving independent data with synchronized control.
+
+---
+
+## 💻 9. Build and Execution Commands
+
+To reproduce the results or run your own tests on the Systolic Array, use the following commands.
+
+### A. Building the Bare-Metal Payload
+The C code (containing the SIMD payload and synchronization logic) must be compiled statically with the `test.ld` linker script. 
+```bash
+cd /home/jolsen16/chipyard
+source env.sh
+cd /home/jolsen16/rocket-chip-mxu/tests
+
+# Compile the payload
+riscv64-unknown-elf-gcc -march=rv64g -mabi=lp64 -static -mcmodel=medany -fvisibility=hidden -nostdlib -nostartfiles -T test.ld crt.S hello_simd.c syscalls.c sys_stubs.c -o hello_simd.riscv -I. -O2
+```
+
+### B. Verilator Simulation
+Verilator is a fast cycle-accurate software simulator. It takes roughly 25-30 minutes to build the simulator from Chisel sources the first time. 
+```bash
+cd /home/jolsen16/chipyard
+source env.sh
+cd /home/jolsen16/chipyard/sims/verilator
+
+# Build the simulator and run the binary
+make -j4 CONFIG=VerilatorQuadRocketMXUConfig run-binary BINARY=/home/jolsen16/rocket-chip-mxu/tests/hello_simd.riscv
+```
+Note that we use `VerilatorQuadRocketMXUConfig` which explicitly disables clock-gating to prevent simulation stalls.
+
+### C. FireSim Hardware Acceleration (FPGA)
+FireSim uses Amazon EC2 F1 or local Alveo U200 FPGAs to run the simulated hardware at >10 MHz, which is incredibly useful for deep operating system boots or massive workloads.
+
+1. **Build the Bitstream**: (Takes several hours)
+```bash
+cd /home/jolsen16/chipyard
+source env.sh
+cd /home/jolsen16/chipyard/sims/firesim
+firesim buildbitstream
+```
+
+2. **Run the Workload**:
+Ensure that `config_hwdb.yaml`, `config_runtime.yaml`, and your workload JSON (e.g., `systolic.json`) point to your newly compiled `hello_simd.riscv` binary. Then flash the FPGA and run:
+```bash
+firesim infrasetup
+firesim runworkload
+```
+
+> [!TIP]
+> **Verified on 2026-02-25** with Verilator `VerilatorQuadRocketMXUConfig`. All 4 cores wrote `'A'+hartid` to `shared_results[hartid]`, producing `A`, `B`, `C`, `D` in lockstep. See [walkthrough.md](file:///home/jolsen16/.gemini/antigravity/brain/b10fb699-18a6-46d2-a46b-37ba629f065b/walkthrough.md) for full results.
+

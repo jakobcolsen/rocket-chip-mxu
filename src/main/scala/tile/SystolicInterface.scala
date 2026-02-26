@@ -13,6 +13,7 @@ class SystolicInputBundle(implicit p: Parameters) extends Bundle {
   val systolic_stall   = Bool()
   val instruction      = UInt(32.W) // Instruction from Leader
   val instruction_valid = Bool()     // Leader is executing
+  val pc               = UInt(64.W) // Leader's Program Counter
 }
 
 // Flows from Tile -> Mesh Network
@@ -23,6 +24,7 @@ class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
   val systolic_simd_mode   = Bool() // Broadcast Leader Mode
   val instruction      = UInt(32.W) // Instruction from Leader
   val instruction_valid = Bool()     // Leader is executing
+  val pc               = UInt(64.W) // Leader's Program Counter
 }
 
 class SystolicInterface(implicit p: Parameters) extends Module {
@@ -48,15 +50,20 @@ class SystolicInterface(implicit p: Parameters) extends Module {
     val core_data_in  = Input(UInt(64.W))
     val core_data_wen = Input(Bool())
 
-    // Instruction Broadcast
+    // Instruction and PC Broadcast
     val instruction_out = Output(UInt(32.W)) // To Mesh (Leader)
     val instruction_valid_out = Output(Bool()) // To Mesh (Leader)
+    val pc_out          = Output(UInt(64.W)) // Leader's PC to Mesh
     val instruction_in  = Input(UInt(32.W))  // From Mesh (Follower)
     val instruction_valid_in = Input(Bool()) // From Mesh (Follower)
+    val pc_in           = Input(UInt(64.W))  // Leader's PC from Mesh
+
     val core_inst_out   = Input(UInt(32.W))  // From Core (Leader Source)
     val core_inst_valid_out = Input(Bool())  // From Core (Leader Source)
+    val core_pc_out     = Input(UInt(64.W))  // Leader's PC from Core
     val core_inst_in    = Output(UInt(32.W)) // To Core (Follower)
-    val core_inst_valid_in = Output(Bool()) // To Core (Follower)
+    val core_inst_valid_in = Output(Bool())  // To Core (Follower)
+    val core_pc_in      = Output(UInt(64.W)) // Leader's PC to Core Follower
   })
 
   // ------------------------------------------------------------------------
@@ -111,12 +118,14 @@ class SystolicInterface(implicit p: Parameters) extends Module {
   io.alu_opA := source_a_bits
   io.alu_opB := Mux(q_north.io.deq.valid, q_north.io.deq.bits, 0.U)
 
-  // 5. Instruction Broadcast Logic
+  // 5. Instruction and PC Broadcast Logic
   // Leader: instruction_out = core_inst_out (from IB/Core)
   io.instruction_out       := io.core_inst_out
   io.instruction_valid_out := io.core_inst_valid_out
+  io.pc_out                := io.core_pc_out
 
   // Follower: core_inst_in = instruction_in (from Mesh)
   io.core_inst_in          := io.instruction_in
   io.core_inst_valid_in    := io.instruction_valid_in
+  io.core_pc_in            := io.pc_in
 }

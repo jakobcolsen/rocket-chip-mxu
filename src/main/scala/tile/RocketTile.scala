@@ -181,6 +181,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       systolic_out_io.south_out       <> systolic_if.io.south_out
       systolic_out_io.instruction     := systolic_if.io.instruction_out
       systolic_out_io.instruction_valid := systolic_if.io.instruction_valid_out
+      systolic_out_io.pc              := systolic_if.io.pc_out
       
       // 2. Wire to Internal Core Pipeline
       core.io.systolic_opA          := systolic_if.io.alu_opA
@@ -193,10 +194,13 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       // Wire Instruction Broadcast Logic
       systolic_if.io.core_inst_out       := core.io.systolic_instruction_out
       systolic_if.io.core_inst_valid_out := core.io.systolic_instruction_valid_out
+      systolic_if.io.core_pc_out         := core.io.systolic_pc_out
       systolic_if.io.instruction_in       := systolic_in_io.instruction
       systolic_if.io.instruction_valid_in := systolic_in_io.instruction_valid
+      systolic_if.io.pc_in               := systolic_in_io.pc
       core.io.systolic_instruction_in     := systolic_if.io.core_inst_in
       core.io.systolic_instruction_valid_in := systolic_if.io.core_inst_valid_in
+      core.io.systolic_pc_in             := systolic_if.io.core_pc_in
 
       // 3. Wire Core Data Injection (For Software Mesh Control)
       systolic_if.io.core_data_in   := core.io.systolic_data_out
@@ -209,6 +213,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_opB    := 0.U
       core.io.systolic_instruction_in := 0.U
       core.io.systolic_instruction_valid_in := false.B
+      core.io.systolic_pc_in := 0.U
   }
 
   outer.vector_unit.foreach { v =>

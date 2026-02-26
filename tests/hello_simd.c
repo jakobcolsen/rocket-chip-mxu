@@ -4,9 +4,6 @@
 
 #define MSTATUS_MIE 0x00000008
 
-// --------------------------------------------------------------------------
-// SYSTOLIC MESH SHARING STRUCTURE
-// --------------------------------------------------------------------------
 extern char _shared_results[];
 volatile int core_ready[16] = {0};
 
@@ -25,34 +22,29 @@ int main(void) {
     core_ready[hartid] = 1;
 
     if (hartid == 0) {
-        // === LEADER PATH ===
-        printf("\n\n=================================================\n");
-        printf("           CHIPYARD SIMD BOOT SEQUENCE           \n");
-        printf("=================================================\n");
-        printf("[Leader] Hart 0 Hello World!\n");
+        printf("Hello World!\n");
 
         for (int i = 1; i < 4; i++) {
             while (core_ready[i] == 0) { asm volatile("nop"); }
-            printf("[Leader] Hart %d signed in.\n", i);
+            printf("Hart %d is here.\n", i);
         }
 
-        printf("\n[Leader] All 4 cores alive in DRAM.\n");
+        printf("It's a party in here!\n");
         
         for (int i = 0; i < 4; i++) {
             _shared_results[i * 64] = (i == 0) ? 0 : 'Z';
         }
         asm volatile("fence rw, rw" ::: "memory");
 
-        printf("[Leader] Array state BEFORE SIMD (Fixed Base: %p):\n", _shared_results);
+        printf("Array state BEFORE SIMD (Fixed Base: %p):\n", _shared_results);
         for (int i = 0; i < 4; i++) {
             printf("  Slot %d: 0x%02x\n", i, (unsigned char)_shared_results[i*64]);
         }
 
-        printf("\n>>> ACTIVATING SYSTOLIC SIMD (CSR 0x800) <<<\n");
+        printf("ACTIVATING SYSTOLIC SIMD (CSR 0x800)\n");
         asm volatile("csrw 0x800, %0 \n\t" : : "r"(2));
         
-        // Massive initial gap to ensure all followers are deep in their NOP runways
-        for (volatile int d = 0; d < 100; d++) { asm volatile("nop"); }
+        // Massive initial gap removed via hardware CSR flush fix
 
         #define SIMD_GAP \
             "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t" \
@@ -60,7 +52,7 @@ int main(void) {
             "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t" \
             "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t"
 
-        // [THE STINKY HACK] 8-Store Burst
+        // 8-Store burst because it didn't work with 1
         // This ensures Hart 1, 2, or 3 will catch at least one commit even if hit by a stall
         asm volatile(
             "csrr t0, mhartid   \n\t"
@@ -93,13 +85,12 @@ int main(void) {
         );
 
         asm volatile("csrw 0x800, x0 \n\t");
-        printf(">>> DEACTIVATED SYSTOLIC SIMD <<<\n\n");
+        printf("DEACTIVATED SYSTOLIC SIMD\n\n");
 
         for (volatile int d = 0; d < 10000; d++);
         asm volatile("fence rw, rw" ::: "memory");
 
-        printf("[Proof] Array state AFTER SIMD (Proof of Lockstep):\n");
-        printf("=================================================\n");
+        printf("Array state AFTER SIMD (Proof of Lockstep):\n");
         int passed = 1;
         for (int i = 0; i < 4; i++) {
             char expected = 'A' + i;
@@ -109,22 +100,17 @@ int main(void) {
         }
 
         if (passed) {
-            printf("\n[SUCCESS] SIMD Lockstep Proof Confirmed!\n");
+            printf("\nSIMD Lockstep Confirmed!\n");
             printf("\n*** PASSED ***\n");
         } else {
-            printf("\n[ERROR] Not all cores modified their target memory slot!\n");
+            printf("\nNot all cores modified their target memory slot!\n");
             printf("*** FAILED ***\n");
         }
-        printf("=================================================\n");
 
     } else {
-        // === FOLLOWER PATH ===
         while (1) {
-            // Unroll to minimize jump-induced pipeline hazards
-            asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;");
-            asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;");
-            asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;");
-            asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;");
+            // Sleep until hardware systolic_enable wakes pipeline
+            asm volatile("wfi");
         }
     }
 

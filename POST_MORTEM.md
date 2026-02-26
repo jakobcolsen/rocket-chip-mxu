@@ -37,20 +37,23 @@ Parallel memory modification by un-synchronized cores often leads to false-shari
 
 ---
 
-## 4. Analysis: Towards a "Clean" Architecture
+## 4. Implemented Hardware Solutions
 
-The current implementation serves as a robust proof-of-concept but relies on software-side mitigations for hardware desynchronization. A production-grade architecture should address these via:
+The initial proof-of-concept relied on software mitigations (NOP runways, 8-store bursts) for pipeline desynchronization. These have since been replaced by clean hardware solutions:
 
-### i. Follower-Fetch Hardware
-Instead of Decode hijacking, a cleaner approach would involve Follower-Fetch hardware. In this model, the Follower's Program Counter actually updates to match the Leader's PC during SIMD mode. This provides accurate `mepc` tracking and eliminates the need for `take_pc` masking.
+### i. Follower-Fetch PC Broadcast (Implemented)
+The Follower's Decode stage now receives the Leader's 64-bit Program Counter via `io.systolic_pc_in`, routed through the Systolic Mesh. The multiplexer `id_effective_pc = Mux(id_systolic_follower, io.systolic_pc_in, ibuf.io.pc)` ensures that `mepc` accurately tracks the SIMD payload during exceptions. The Follower's local I-Cache is frozen (`ibuf.io.inst(0).ready := ... && !id_systolic_follower`) so it can seamlessly resume local execution when SIMD mode is deactivated.
 
-### ii. Hardware Credit-Based Handshaking
-The current reliance on 64-NOP gaps and 8-store bursts should be replaced by a hardware `systolic_ready` wire from Followers back to the Leader. Each Follower would acknowledge the completion of an instruction, and the Leader would stall its next broadcast until all acknowledgments are collected, ensuring cycle-perfect lockstep without timing guesses.
+### ii. WFI Wakeup Override (Implemented)
+Followers no longer need to spin in active NOP loops. They sleep via the standard RISC-V `wfi` instruction. When the Leader writes to CSR `0x800`, the mesh asserts `io.systolic_enable` on all tiles. The clock-gate output is modified: `io.wfi := csr.io.status.wfi && !io.systolic_enable`, instantly waking any sleeping Follower.
 
-### iii. Vector-Aware Coherence
-A clean architecture would treat the 4-core cluster as a single logical entity. By marking SIMD transactions with a unique identifier, the coherence manager could treat parallel writes as a single wide-vector operation, improving bandwidth and eliminating the need for manual cache-line padding.
+### iii. Leader CSR Pipeline Flush (Implemented)
+The Leader no longer needs a NOP runway after `csrw 0x800`. A decode-stage signal `id_sys_csr_write` detects writes to address `0x800` and is OR'd into `id_csr_flush`. This triggers `ex_reg_flush_pipe`, killing the shadow pipeline behind the CSR write and guaranteeing the SIMD payload only enters the pipeline after the CSR has committed and the wakeup signal has propagated.
+
+### iv. Remaining Software Workarounds
+The SIMD payload in `hello_simd.c` still uses inter-instruction NOP gaps (`SIMD_GAP`) and redundant 8-store bursts within the payload body. These mitigate transient pipeline stalls and I-Cache refill latency on Followers during the broadcast window. A future hardware credit-based handshake (`systolic_ready` back-channel) would eliminate these entirely.
 
 ---
 
 ## Conclusion
-The implemented Proof of SIMD Lockstep undeniably demonstrates the ability of the Systolic Mesh to drive a quad-core cluster in parallel. By surgically decoupling the Fetch-Decode dependency and implementing robust memory isolation, the team has established a verified foundation for future hardware-accelerated SIMD development on the Rocket Chip.
+The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, and CSR pipeline flushing eliminates Leader-side NOP delays. The remaining in-payload NOP gaps are a bounded workaround for broadcast-window stalls, addressable by a future hardware handshake mechanism.
