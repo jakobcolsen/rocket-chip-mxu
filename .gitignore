@@ -19,7 +19,7 @@ rocketchip.jar
 # Compilation Artifacts
 *.o
 *.d
-*.riscv
+*.riscv*
 *.hex
 *.dump
 

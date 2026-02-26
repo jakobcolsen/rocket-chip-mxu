@@ -61,7 +61,23 @@ void __attribute__((noreturn)) tohost_exit(uintptr_t code)
 
 uintptr_t __attribute__((weak)) handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32])
 {
-  tohost_exit(1337);
+  uint64_t hartid, real_cause, real_epc, real_tval;
+  asm volatile("csrr %0, mhartid" : "=r"(hartid));
+  asm volatile("csrr %0, mcause" : "=r"(real_cause));
+  asm volatile("csrr %0, mepc" : "=r"(real_epc));
+  asm volatile("csrr %0, mtval" : "=r"(real_tval));
+
+  // CRITICAL: only Hart 0 may use tohost (HTIF is single-hart).
+  // Followers must spin forever on trap to avoid clobbering tohost.
+  if (hartid != 0) {
+    printf("[Hart %d] FOLLOWER TRAP cause=%d epc=%lx tval=%lx\n", (int)hartid, (int)real_cause, (unsigned long)real_epc, (unsigned long)real_tval); while(1) { asm volatile("nop"); }
+  }
+  
+  printf("[Hart %d] TRAP cause=%d epc=%lx tval=%lx\n", (int)hartid, (int)real_cause, (unsigned long)real_epc, (unsigned long)real_tval);
+  
+  // Encode as 0xHHCCOSSS where HH=hartid, CC=cause, SSS=1337
+  uintptr_t code = ((hartid & 0xFF) << 24) | ((real_cause & 0xFF) << 16) | 0x1337;
+  tohost_exit(code);
 }
 
 void exit(int code)
@@ -111,11 +127,19 @@ void _init(int cid, int nc)
   exit(ret);
 }
 
+
+int puts(const char* s)
+{
+  printstr(s);
+  printstr("\n");
+  return 0;
+}
+
 #undef putchar
 int putchar(int ch)
 {
-  static __thread char buf[64] __attribute__((aligned(64)));
-  static __thread int buflen = 0;
+  static char buf[128] __attribute__((aligned(64)));
+  static int buflen = 0;
 
   buf[buflen++] = ch;
 

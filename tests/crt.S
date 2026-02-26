@@ -43,31 +43,22 @@ _start:
     li  t5, 0
     li  t6, 0
 
-    # 4. Set up stack pointer (8KB per core, starting from HIGH MEMORY)
-    # We use 0x88000000 (128MB offset) to avoid colliding with text at 0x80000000
+    # 4. Set up stack pointer (8KB per core)
+    # Use 0x80100000 (1MB offset) to be safe within smaller DRAM configs
     csrr a0, mhartid
-    li t0, 0x2000      # 8KB stack size per hart
+    li  t0, 0x2000      # 8KB stack size per hart
     mul t1, a0, t0
-    li sp, 0x88000000  # Stack base (Top of stack for Hart 0)
-    sub sp, sp, t1     # sp = 0x88000000 - (hartid * 8KB)
+    li  sp, 0x80100000  # Stack base (Top of stack for Hart 0)
+    sub sp, sp, t1      # sp = 0x80100000 - (hartid * 8KB)
 
-    # 5. Jump to main
-    tail main
+    # 5. Call _init (which calls thread_entry then main)
+    # a0 = hartid, a1 = num_harts (approximate)
+    csrr a0, mhartid
+    li a1, 4
+    jal ra, _init
 
-.section .text
-.global handle_trap
-handle_trap:
-    # Print trap info to UART (0x10020000)
-    # This is a minimal debug handler
-    li t0, 0x10020000
-    
-    # Check for reasons (mcause)
-    csrr t1, mcause
-    # (Simple print loop could go here if we had a function, 
-    #  but we want to be minimal and robust)
-
-    # Infinite loop to catch the trap
-1:  j 1b
+    # 6. Exit with return value of main
+    jal ra, exit
 
 .section .tohost,"aw",@progbits
 .align 6

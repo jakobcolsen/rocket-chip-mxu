@@ -271,84 +271,104 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     Seq(new IDecode)
   } flatMap(_.table)
 
-  val ex_ctrl = Reg(new IntCtrlSigs)
-  val mem_ctrl = Reg(new IntCtrlSigs)
-  val wb_ctrl = Reg(new IntCtrlSigs)
+  val ex_ctrl = RegInit(0.U.asTypeOf(new IntCtrlSigs))
+  val mem_ctrl = RegInit(0.U.asTypeOf(new IntCtrlSigs))
+  val wb_ctrl = RegInit(0.U.asTypeOf(new IntCtrlSigs))
 
-  val ex_reg_xcpt_interrupt  = Reg(Bool())
+  val ex_reg_xcpt_interrupt  = RegInit(false.B)
   val ex_reg_valid           = RegInit(false.B)
-  val ex_reg_rvc             = Reg(Bool())
+  val ex_reg_rvc             = RegInit(false.B)
   val ex_reg_btb_resp        = Reg(new BTBResp)
-  val ex_reg_xcpt            = Reg(Bool())
-  val ex_reg_flush_pipe      = Reg(Bool())
-  val ex_reg_load_use        = Reg(Bool())
-  val ex_reg_cause           = Reg(UInt())
-  val ex_reg_replay = Reg(Bool())
-  val ex_reg_pc = Reg(UInt())
-  val ex_reg_mem_size = Reg(UInt())
-  val ex_reg_hls = Reg(Bool())
-  val ex_reg_inst = Reg(Bits())
-  val ex_reg_raw_inst = Reg(UInt())
-  val ex_reg_wphit            = Reg(Vec(nBreakpoints, Bool()))
-  val ex_reg_set_vconfig      = Reg(Bool())
+  val ex_reg_xcpt            = RegInit(false.B)
+  val ex_reg_flush_pipe      = RegInit(false.B)
+  val ex_reg_load_use        = RegInit(false.B)
+  val ex_reg_cause           = RegInit(0.U)
+  val ex_reg_replay = RegInit(false.B)
+  val ex_reg_pc = RegInit(0.U)
+  val ex_reg_mem_size = RegInit(0.U)
+  val ex_reg_hls = RegInit(false.B)
+  val ex_reg_inst = RegInit(0.U(32.W))
+  val ex_reg_raw_inst = RegInit(0.U(32.W))
+  val ex_reg_systolic_follower = RegInit(false.B)
+  val ex_reg_wphit            = RegInit(0.U.asTypeOf(Vec(nBreakpoints, Bool())))
+  val ex_reg_set_vconfig      = RegInit(false.B)
 
-  val mem_reg_xcpt_interrupt  = Reg(Bool())
+  val mem_reg_xcpt_interrupt  = RegInit(false.B)
   val mem_reg_valid           = RegInit(false.B)
-  val mem_reg_rvc             = Reg(Bool())
+  val mem_reg_rvc             = RegInit(false.B)
   val mem_reg_btb_resp        = Reg(new BTBResp)
-  val mem_reg_xcpt            = Reg(Bool())
-  val mem_reg_replay          = Reg(Bool())
-  val mem_reg_flush_pipe      = Reg(Bool())
-  val mem_reg_cause           = Reg(UInt())
-  val mem_reg_slow_bypass     = Reg(Bool())
-  val mem_reg_load            = Reg(Bool())
-  val mem_reg_store           = Reg(Bool())
-  val mem_reg_set_vconfig     = Reg(Bool())
-  val mem_reg_sfence = Reg(Bool())
-  val mem_reg_pc = Reg(UInt())
-  val mem_reg_inst = Reg(Bits())
-  val mem_reg_mem_size = Reg(UInt())
-  val mem_reg_hls_or_dv = Reg(Bool())
-  val mem_reg_raw_inst = Reg(UInt())
-  val mem_reg_wdata = Reg(Bits())
-  val mem_reg_rs2 = Reg(Bits())
-  val mem_br_taken = Reg(Bool())
+  val mem_reg_xcpt            = RegInit(false.B)
+  val mem_reg_replay          = RegInit(false.B)
+  val mem_reg_flush_pipe      = RegInit(false.B)
+  val mem_reg_cause           = RegInit(0.U)
+  val mem_reg_slow_bypass     = RegInit(false.B)
+  val mem_reg_load            = RegInit(false.B)
+  val mem_reg_store           = RegInit(false.B)
+  val mem_reg_set_vconfig     = RegInit(false.B)
+  val mem_reg_sfence = RegInit(false.B)
+  val mem_reg_pc = RegInit(0.U)
+  val mem_reg_inst = RegInit(0.U(32.W))
+  val mem_reg_systolic_follower = RegInit(false.B)
+  val mem_reg_mem_size = RegInit(0.U)
+  val mem_reg_hls_or_dv = RegInit(false.B)
+  val mem_reg_raw_inst = RegInit(0.U(32.W))
+  val mem_reg_wdata = RegInit(0.U)
+  val mem_reg_rs2 = RegInit(0.U)
+  val mem_br_taken = RegInit(false.B)
   val take_pc_mem = Wire(Bool())
-  val mem_reg_wphit          = Reg(Vec(nBreakpoints, Bool()))
+  val mem_reg_wphit          = RegInit(0.U.asTypeOf(Vec(nBreakpoints, Bool())))
 
   val wb_reg_valid           = RegInit(false.B)
-  val wb_reg_xcpt            = Reg(Bool())
-  val wb_reg_replay          = Reg(Bool())
-  val wb_reg_flush_pipe      = Reg(Bool())
-  val wb_reg_cause           = Reg(UInt())
-  val wb_reg_set_vconfig     = Reg(Bool())
-  val wb_reg_sfence = Reg(Bool())
-  val wb_reg_pc = Reg(UInt())
-  val wb_reg_mem_size = Reg(UInt())
-  val wb_reg_hls_or_dv = Reg(Bool())
-  val wb_reg_hfence_v = Reg(Bool())
-  val wb_reg_hfence_g = Reg(Bool())
-  val wb_reg_inst = Reg(Bits())
-  val wb_reg_raw_inst = Reg(UInt())
-  val wb_reg_wdata = Reg(Bits())
-  val wb_reg_rs2 = Reg(Bits())
+  val wb_reg_xcpt            = RegInit(false.B)
+  val wb_reg_replay          = RegInit(false.B)
+  val wb_reg_flush_pipe      = RegInit(false.B)
+  val wb_reg_cause           = RegInit(0.U)
+  val wb_reg_set_vconfig     = RegInit(false.B)
+  val wb_reg_sfence = RegInit(false.B)
+  val wb_reg_pc = RegInit(io.reset_vector)
+  val wb_reg_mem_size = RegInit(0.U)
+  val wb_reg_hls_or_dv = RegInit(false.B)
+  val wb_reg_hfence_v = RegInit(false.B)
+  val wb_reg_hfence_g = RegInit(false.B)
+  val wb_reg_inst = RegInit(0.U(32.W))
+  val wb_reg_raw_inst = RegInit(0.U(32.W))
+  val wb_reg_wdata = RegInit(0.U)
+  val wb_reg_rs2 = RegInit(0.U)
   val take_pc_wb = Wire(Bool())
-  val wb_reg_wphit           = Reg(Vec(nBreakpoints, Bool()))
+  val rf_wen = Wire(Bool())
+  val rf_waddr = Wire(UInt(5.W))
+  val rf_wdata = Wire(UInt(xLen.W))
+  val wb_reg_wphit           = RegInit(0.U.asTypeOf(Vec(nBreakpoints, Bool())))
 
 
+
+  // --- Systolic Hardware State (Moved up to prevent forward reference NPE) ---
+  val is_leader = io.hartid === 0.U
+  val id_systolic_follower = io.systolic_enable && !is_leader
 
   val take_pc_mem_wb = take_pc_wb || take_pc_mem
-  val take_pc = take_pc_mem_wb
+  // [Fix C] Mask take_pc for followers to prevent them from "following" leader's jumps/branches
+  // and escaping their local spin-loops.
+  val take_pc = take_pc_mem_wb && !id_systolic_follower
 
   // decode stage
   val ibuf = Module(new IBuf)
   ibuf.io.imem <> io.imem.resp
   ibuf.io.kill := take_pc
-  val id_expanded_inst = ibuf.io.inst.map(_.bits.inst)
-  val id_raw_inst = ibuf.io.inst.map(_.bits.raw)
-  val id_inst = id_expanded_inst.map(_.bits)
+
+  // Systolic Instruction Expansion
   
-  // --- Systolic Hardware State ---
+  val systolic_expanded_inst = Wire(new ExpandedInstruction)
+  systolic_expanded_inst.bits := io.systolic_instruction_in
+  systolic_expanded_inst.rd   := io.systolic_instruction_in(11,7)
+  systolic_expanded_inst.rs1  := io.systolic_instruction_in(19,15)
+  systolic_expanded_inst.rs2  := io.systolic_instruction_in(24,20)
+  systolic_expanded_inst.rs3  := io.systolic_instruction_in(31,27)
+
+  val id_expanded_inst = ibuf.io.inst.map(i => Mux(id_systolic_follower, systolic_expanded_inst, i.bits.inst))
+  val id_raw_inst = ibuf.io.inst.map(i => Mux(id_systolic_follower, io.systolic_instruction_in, i.bits.raw))
+  val id_inst = id_expanded_inst.map(_.bits)
+
   val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls, tile.roccCSRs.flatten, tile.rocketParams.beuAddr.isDefined))
   val customCSRs = Wire(new RocketCustomCSRs)
   io.systolic_master_ctrl := customCSRs.systolicMasterCtrl
@@ -356,10 +376,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.systolic_data_out    := customCSRs.systolicDataOut
   io.systolic_data_wen    := customCSRs.systolicDataWen
 
-  val is_leader = io.hartid === 0.U
-  // [Fix A] Use Global Enable Input (driven by Leader) instead of local CSR
-  val id_systolic_follower = io.systolic_enable && !is_leader
-  val id_effective_inst = Mux(id_systolic_follower, io.systolic_instruction_in, id_inst(0))
+  val id_effective_expanded_inst = id_expanded_inst(0)
+  val id_effective_inst = id_inst(0)
   val id_effective_valid = Mux(id_systolic_follower, io.systolic_instruction_valid_in, ibuf.io.inst(0).valid)
 
   require(decodeWidth == 1 /* TODO */ && retireWidth == decodeWidth)
@@ -390,16 +408,16 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
 
   def decodeReg(x: UInt) = (x.extract(x.getWidth-1, lgNXRegs).asBool, x(lgNXRegs-1, 0))
-  val effective_expanded_inst = id_effective_inst.asTypeOf(new ExpandedInstruction)
-  val (id_raddr3_illegal, id_raddr3) = decodeReg(effective_expanded_inst.rs3)
-  val (id_raddr2_illegal, id_raddr2) = decodeReg(effective_expanded_inst.rs2)
-  val (id_raddr1_illegal, id_raddr1) = decodeReg(effective_expanded_inst.rs1)
-  val (id_waddr_illegal,  id_waddr)  = decodeReg(effective_expanded_inst.rd)
+  val (id_raddr3_illegal, id_raddr3) = decodeReg(id_effective_expanded_inst.rs3)
+  val (id_raddr2_illegal, id_raddr2) = decodeReg(id_effective_expanded_inst.rs2)
+  val (id_raddr1_illegal, id_raddr1) = decodeReg(id_effective_expanded_inst.rs1)
+  val (id_waddr_illegal,  id_waddr)  = decodeReg(id_effective_expanded_inst.rd)
 
   val id_load_use = Wire(Bool())
   val id_reg_fence = RegInit(false.B)
   val id_ren = IndexedSeq(id_ctrl.rxs1, id_ctrl.rxs2)
   val id_raddr = IndexedSeq(id_raddr1, id_raddr2)
+  val ex_reg_raddr = RegInit(0.U.asTypeOf(Vec(id_raddr.size, UInt(5.W))))
   val rf = new RegFile(regAddrMask, xLen)
   val id_rs = id_raddr.map(rf.read _)
   val ctrl_killd = Wire(Bool())
@@ -552,37 +570,44 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val wb_waddr = wb_reg_inst(11,7) & regAddrMask.U
   val bypass_sources = IndexedSeq(
     (true.B, 0.U, 0.U), // treat reading x0 as a bypass
-    (ex_reg_valid && ex_ctrl.wxd, ex_waddr, mem_reg_wdata),
+    (ex_reg_valid && ex_ctrl.wxd && !ex_ctrl.mem, ex_waddr, mem_reg_wdata),
     (mem_reg_valid && mem_ctrl.wxd && !mem_ctrl.mem, mem_waddr, wb_reg_wdata),
     (mem_reg_valid && mem_ctrl.wxd, mem_waddr, dcache_bypass_data))
   val id_bypass_src = id_raddr.map(raddr => bypass_sources.map(s => s._1 && s._2 === raddr))
 
   // execute stage
-  val bypass_mux = bypass_sources.map(_._3)
-  val ex_reg_rs_bypass = Reg(Vec(id_raddr.size, Bool()))
-  val ex_reg_rs_lsb = Reg(Vec(id_raddr.size, UInt(log2Ceil(bypass_sources.size).W)))
-  val ex_reg_rs_msb = Reg(Vec(id_raddr.size, UInt()))
-  val ex_rs = for (i <- 0 until id_raddr.size)
-    yield Mux(ex_reg_rs_bypass(i), bypass_mux(ex_reg_rs_lsb(i)), Cat(ex_reg_rs_msb(i), ex_reg_rs_lsb(i)))
+  val ex_reg_rs = RegInit(0.U.asTypeOf(Vec(id_raddr.size, UInt(xLen.W))))
+
+  val ex_rs = (0 until id_raddr.size).map { i =>
+    val raddr = ex_reg_raddr(i)
+    val do_bypass_mem = mem_reg_valid && mem_ctrl.wxd && !mem_ctrl.mem && mem_waddr === raddr && raddr =/= 0.U
+    val do_bypass_wb  = rf_wen && rf_waddr === raddr && raddr =/= 0.U
+    
+    val res = Mux(do_bypass_mem, mem_reg_wdata,
+              Mux(do_bypass_wb,  rf_wdata,
+                                 ex_reg_rs(i)))
+    res
+  }
   val ex_imm = ImmGen(ex_ctrl.sel_imm, ex_reg_inst)
   val ex_rs1shl = Mux(ex_reg_inst(3), ex_rs(0)(31,0), ex_rs(0)) << ex_reg_inst(14,13)
   val ex_op1_normal = MuxLookup(ex_ctrl.sel_alu1, 0.S)(Seq(
     A1_RS1 -> ex_rs(0).asSInt,
-    A1_PC -> ex_reg_pc.asSInt,
-    A1_RS1SHL -> (if (rocketParams.useZba) ex_rs1shl.asSInt else 0.S)
+    A1_PC -> ex_reg_pc.asSInt
   ))
-  val ex_op1 = Mux(io.systolic_enable && customCSRs.systolicSimdMode && !is_leader, io.systolic_opA.asSInt, ex_op1_normal)
+  
+  val ex_op1 = ex_op1_normal // [Fix B] Let followers use local registers for normal instructions
 
   val ex_op2_oh = UIntToOH(Mux(ex_ctrl.sel_alu2(0), (ex_reg_inst >> 20).asUInt, ex_rs(1))(log2Ceil(xLen)-1,0)).asSInt
   val ex_op2_normal = MuxLookup(ex_ctrl.sel_alu2, 0.S)(Seq(
     A2_RS2 -> ex_rs(1).asSInt,
     A2_IMM -> ex_imm,
-    A2_SIZE -> Mux(ex_reg_rvc, 2.S, 4.S),
+    A2_SIZE -> Mux(ex_reg_rvc, 2.S, 4.S)
   ) ++ (if (coreParams.useZbs) Seq(
     A2_RS2OH -> ex_op2_oh,
     A2_IMMOH -> ex_op2_oh,
   ) else Nil))
-  val ex_op2 = Mux(io.systolic_enable && customCSRs.systolicSimdMode && !is_leader, io.systolic_opB.asSInt, ex_op2_normal)
+  
+  val ex_op2 = ex_op2_normal // [Fix B] Let followers use local registers for normal instructions
 
 
   val (ex_new_vl, ex_new_vconfig) = if (usingVector) {
@@ -668,20 +693,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     }
 
     for (i <- 0 until id_raddr.size) {
-      val do_bypass = id_bypass_src(i).reduce(_||_)
-      val bypass_src = PriorityEncoder(id_bypass_src(i))
-      ex_reg_rs_bypass(i) := do_bypass
-      ex_reg_rs_lsb(i) := bypass_src
-      when (id_ren(i) && !do_bypass) {
-        ex_reg_rs_lsb(i) := id_rs(i)(log2Ceil(bypass_sources.size)-1, 0)
-        ex_reg_rs_msb(i) := id_rs(i) >> log2Ceil(bypass_sources.size)
-      }
+      ex_reg_raddr(i) := id_raddr(i)
+      val do_bypass_wb = rf_wen && rf_waddr === id_raddr(i) && id_raddr(i) =/= 0.U
+      ex_reg_rs(i) := Mux(do_bypass_wb, rf_wdata, id_rs(i))
     }
     when (id_illegal_insn || id_virtual_insn) {
       val inst = Mux(ibuf.io.inst(0).bits.rvc, id_raw_inst(0)(15, 0), id_raw_inst(0))
-      ex_reg_rs_bypass(0) := false.B
-      ex_reg_rs_lsb(0) := inst(log2Ceil(bypass_sources.size)-1, 0)
-      ex_reg_rs_msb(0) := inst >> log2Ceil(bypass_sources.size)
+      ex_reg_rs(0) := inst
     }
   }
   when (!ctrl_killd || csr.io.interrupt || ibuf.io.inst(0).bits.replay) {
@@ -690,6 +708,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     ex_reg_raw_inst := id_raw_inst(0)
     ex_reg_pc := ibuf.io.pc
     ex_reg_btb_resp := ibuf.io.btb_resp
+    ex_reg_systolic_follower := id_systolic_follower
     ex_reg_wphit := bpu.io.bpwatch.map { bpw => bpw.ivalid(0) }
     ex_reg_set_vconfig := id_set_vconfig && !id_xcpt
   }
@@ -722,7 +741,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_npc = (Mux(mem_ctrl.jalr || mem_reg_sfence, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).asSInt, mem_br_target) & (-2).S).asUInt
   val mem_wrong_npc =
     Mux(ex_pc_valid, mem_npc =/= ex_reg_pc,
-    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc, true.B))
+    Mux(ibuf.io.inst(0).valid || ibuf.io.imem.valid, mem_npc =/= ibuf.io.pc, true.B)) && !mem_reg_systolic_follower
   val mem_npc_misaligned = !csr.io.status.isa('c'-'a') && mem_npc(1) && !mem_reg_sfence
   val mem_int_wdata = Mux(!mem_reg_xcpt && (mem_ctrl.jalr ^ mem_npc_misaligned), mem_br_target, mem_reg_wdata.asSInt).asUInt
   val mem_cfi = mem_ctrl.branch || mem_ctrl.jalr || mem_ctrl.jal
@@ -751,6 +770,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_slow_bypass := ex_slow_bypass
     mem_reg_wphit := ex_reg_wphit
     mem_reg_set_vconfig := ex_reg_set_vconfig
+    mem_reg_systolic_follower := ex_reg_systolic_follower
 
     mem_reg_cause := ex_cause
     mem_reg_inst := ex_reg_inst
@@ -917,9 +937,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   val wb_valid = wb_reg_valid && !replay_wb && !wb_xcpt
   val wb_wen = wb_valid && wb_ctrl.wxd
-  val rf_wen = wb_wen || ll_wen
-  val rf_waddr = Mux(ll_wen, ll_waddr, wb_waddr)
-  val rf_wdata = Mux(dmem_resp_valid && dmem_resp_xpu, io.dmem.resp.bits.data(xLen-1, 0),
+  rf_wen := wb_wen || ll_wen || (dmem_resp_valid && dmem_resp_xpu)
+  rf_waddr := Mux(dmem_resp_valid && dmem_resp_xpu, dmem_resp_waddr,
+              Mux(ll_wen, ll_waddr,
+              wb_waddr))
+  rf_wdata := Mux(dmem_resp_valid && dmem_resp_xpu, io.dmem.resp.bits.data(xLen-1, 0),
                  Mux(ll_wen, ll_wdata,
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
@@ -1170,7 +1192,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.imem.sfence.bits.hg := wb_reg_hfence_g
   io.ptw.sfence := io.imem.sfence
 
-  ibuf.io.inst(0).ready := !ctrl_stalld && !(customCSRs.systolicSimdMode && !is_leader)
+  ibuf.io.inst(0).ready := !ctrl_stalld && !id_systolic_follower
 
   io.imem.btb_update.valid := mem_reg_valid && !take_pc_wb && mem_wrong_npc && (!mem_cfi || mem_cfi_taken)
   io.imem.btb_update.bits.isValid := mem_cfi
@@ -1343,6 +1365,44 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     }
     when (csr.io.trace(0).valid) {
       //    coreMonitorBundle.inst, coreMonitorBundle.inst)
+    }
+  }
+
+  // ---- SIMD Transition Trace (fires during SIMD window + tail) ----
+  val simd_trace_countdown = RegInit(0.U(8.W))
+  when (io.systolic_enable) {
+    simd_trace_countdown := 20.U  // trace 20 cycles after SIMD goes low
+  }.elsewhen (simd_trace_countdown > 0.U) {
+    simd_trace_countdown := simd_trace_countdown - 1.U
+  }
+  val simd_trace_active = io.systolic_enable || simd_trace_countdown > 0.U
+  when (simd_trace_active) {
+    printf("SIMD_TRACE C%d t=%d PC=%x en=%d fol=%d inst=%x v=%d wb_pc=%x wb_v=%d wb_inst=%x\n",
+      io.hartid, csr.io.time(31,0), ibuf.io.pc,
+      io.systolic_enable, id_systolic_follower,
+      id_effective_inst, id_effective_valid,
+      wb_reg_pc, wb_reg_valid, wb_reg_raw_inst)
+  }
+
+  when (simd_trace_active || csr.io.time < 1000.U) {
+    printf("C%d t=%d PC=%x ID[%x,v=%d,x=%d,c=%x] EX[%x,v=%d,x=%d,a=%x,b=%x] MEM[%x,v=%d,x=%d,w=%x] WB[%x,v=%d,x=%d,r=%x] PRV=%d TPC[%d,%d,%d] EVEC=%x ICAUS=%x\n",
+      io.hartid, csr.io.time(31,0), ibuf.io.pc, id_inst(0), id_effective_valid, id_xcpt, id_cause,
+      ex_reg_pc, ex_reg_valid, ex_reg_xcpt, ex_op1.asUInt, ex_op2.asUInt,
+      mem_reg_pc, mem_reg_valid, mem_reg_xcpt, mem_reg_wdata,
+      wb_reg_pc, wb_reg_valid, wb_reg_xcpt, wb_reg_raw_inst,
+      csr.io.status.prv, take_pc, take_pc_mem, take_pc_wb,
+      csr.io.evec, csr.io.interrupt_cause)
+    
+    printf("  C%d ID_RS[0=%x,1=%x,r0=%d,r1=%d,by0=%x,by1=%x]\n",
+      io.hartid, id_rs(0), id_rs(1), id_raddr(0), id_raddr(1), 
+      Cat(id_bypass_src(0).reverse), Cat(id_bypass_src(1).reverse))
+
+    when (rf_wen && rf_waddr =/= 0.U) {
+      printf("  C%d W x%d=%x\n", io.hartid, rf_waddr, rf_wdata)
+    }
+    
+    when (take_pc_wb || take_pc_mem || take_pc_mem_wb) {
+      printf("  C%d TAKE_PC wb=%d mem=%d mem_wb=%d\n", io.hartid, take_pc_wb, take_pc_mem, take_pc_mem_wb)
     }
   }
 
