@@ -1170,7 +1170,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.div && (!(div.io.req.ready || (div.io.resp.valid && !wb_wxd)) || div.io.req.valid) || // reduce odds of replay
     !clock_en ||
     id_do_fence ||
-    csr.io.csr_stall ||
+    csr.io.csr_stall && !io.systolic_enable ||
     id_reg_pause ||
     io.traceStall
   // [Fix A] Mask perma-kill from frozen IBuf replay
@@ -1297,7 +1297,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.cease := csr.io.status.cease && !clock_en_reg
   io.wfi := csr.io.status.wfi && !io.systolic_enable
   if (rocketParams.clockGate) {
-    long_latency_stall := csr.io.csr_stall || io.dmem.perf.blocked || id_reg_pause && !unpause
+    long_latency_stall := (csr.io.csr_stall && !io.systolic_enable) || io.dmem.perf.blocked || id_reg_pause && !unpause
     clock_en := (clock_en_reg || ex_pc_valid || (!long_latency_stall && io.imem.resp.valid)) && !io.systolic_stall
     clock_en_reg :=
       ex_pc_valid || mem_pc_valid || wb_pc_valid || // instruction in flight
