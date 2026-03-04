@@ -4,7 +4,7 @@
 
 #define MSTATUS_MIE 0x00000008
 
-extern char _shared_results[];
+volatile char shared_results[4][64] __attribute__((aligned(64)));
 volatile int core_ready[16] = {0};
 
 void thread_entry(int cid, int nc) {
@@ -32,13 +32,13 @@ int main(void) {
         printf("It's a party in here!\n");
         
         for (int i = 0; i < 4; i++) {
-            _shared_results[i * 64] = (i == 0) ? 0 : 'Z';
+            shared_results[i][0] = (i == 0) ? 0 : 'Z';
         }
         asm volatile("fence rw, rw" ::: "memory");
 
-        printf("Array state BEFORE SIMD (Fixed Base: %p):\n", _shared_results);
+        printf("Array state BEFORE SIMD (Fixed Base: %p):\n", shared_results);
         for (int i = 0; i < 4; i++) {
-            printf("  Slot %d: 0x%02x\n", i, (unsigned char)_shared_results[i*64]);
+            printf("  Slot %d: 0x%02x\n", i, (unsigned char)shared_results[i][0]);
         }
 
         printf("ACTIVATING SYSTOLIC SIMD (CSR 0x800)\n");
@@ -46,41 +46,18 @@ int main(void) {
         
         // Massive initial gap removed via hardware CSR flush fix
 
-        #define SIMD_GAP \
-            "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t" \
-            "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t" \
-            "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t" \
-            "nop \n\t" "nop \n\t" "nop \n\t" "nop \n\t"
-
-        // 8-Store burst because it didn't work with 1
-        // This ensures Hart 1, 2, or 3 will catch at least one commit even if hit by a stall
+        // Hardware global stall eliminates the need for NOP gaps and redundant stores.
+        // Each instruction is held by the Leader until all Followers have consumed it.
         asm volatile(
             "csrr t0, mhartid   \n\t"
-            SIMD_GAP
-            "lui  t1, %%hi(_shared_results) \n\t"
-            SIMD_GAP
-            "addi t1, t1, %%lo(_shared_results) \n\t"
-            SIMD_GAP
+            "lui  t1, %%hi(shared_results) \n\t"
+            "addi t1, t1, %%lo(shared_results) \n\t"
             "slli t3, t0, 6     \n\t"
-            SIMD_GAP
             "add  t1, t1, t3    \n\t"
-            SIMD_GAP
             "li   t2, 'A'       \n\t"
-            SIMD_GAP
             "add  t2, t2, t0    \n\t"
-            SIMD_GAP
             "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            "sb   t2, 0(t1)     \n\t"
-            SIMD_GAP
-            "fence rw, rw      \n\t"
-            "fence rw, rw      \n\t"
-            SIMD_GAP
+            "fence rw, rw       \n\t"
             ::: "t0", "t1", "t2", "t3", "memory"
         );
 
@@ -94,7 +71,7 @@ int main(void) {
         int passed = 1;
         for (int i = 0; i < 4; i++) {
             char expected = 'A' + i;
-            char actual = _shared_results[i * 64];
+            char actual = shared_results[i][0];
             printf("  Slot %d: '%c' (0x%02x)\n", i, actual, (unsigned char)actual);
             if (actual != expected) passed = 0;
         }

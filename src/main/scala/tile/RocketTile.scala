@@ -205,6 +205,10 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       // 3. Wire Core Data Injection (For Software Mesh Control)
       systolic_if.io.core_data_in   := core.io.systolic_data_out
       systolic_if.io.core_data_wen  := core.io.systolic_data_wen
+
+      // 4. Wire Global Stall Backpressure
+      systolic_if.io.core_stall_out := core.io.systolic_stall_out
+      systolic_out_io.systolic_stall_out := systolic_if.io.stall_out
   } else {
       // Tie off core systolic ports if needed, or leave disconnected if strictly input
       core.io.systolic_enable := false.B

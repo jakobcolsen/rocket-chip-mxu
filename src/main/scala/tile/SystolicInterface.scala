@@ -10,10 +10,10 @@ class SystolicInputBundle(implicit p: Parameters) extends Bundle {
   val west_in          = Decoupled(UInt(64.W))
   val north_in         = Decoupled(UInt(64.W))
   val systolic_enable  = Bool()
-  val systolic_stall   = Bool()
-  val instruction      = UInt(32.W) // Instruction from Leader
+  val systolic_stall   = Bool()      // Global stall from mesh OR-tree
+  val instruction      = UInt(32.W)  // Instruction from Leader
   val instruction_valid = Bool()     // Leader is executing
-  val pc               = UInt(64.W) // Leader's Program Counter
+  val pc               = UInt(64.W)  // Leader's Program Counter
 }
 
 // Flows from Tile -> Mesh Network
@@ -21,10 +21,11 @@ class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
   val east_out         = Decoupled(UInt(64.W))
   val south_out        = Decoupled(UInt(64.W))
   val systolic_master_ctrl = Bool()
-  val systolic_simd_mode   = Bool() // Broadcast Leader Mode
-  val instruction      = UInt(32.W) // Instruction from Leader
+  val systolic_simd_mode   = Bool()  // Broadcast Leader Mode
+  val systolic_stall_out   = Bool()  // Core needs the array to stall
+  val instruction      = UInt(32.W)  // Instruction from Leader
   val instruction_valid = Bool()     // Leader is executing
-  val pc               = UInt(64.W) // Leader's Program Counter
+  val pc               = UInt(64.W)  // Leader's Program Counter
 }
 
 class SystolicInterface(implicit p: Parameters) extends Module {
@@ -64,6 +65,10 @@ class SystolicInterface(implicit p: Parameters) extends Module {
     val core_inst_in    = Output(UInt(32.W)) // To Core (Follower)
     val core_inst_valid_in = Output(Bool())  // To Core (Follower)
     val core_pc_in      = Output(UInt(64.W)) // Leader's PC to Core Follower
+
+    // Global Stall Backpressure
+    val core_stall_out  = Input(Bool())      // From Core: core needs array to stall
+    val stall_out       = Output(Bool())     // To Mesh: passthrough (combinational)
   })
 
   // ------------------------------------------------------------------------
@@ -128,4 +133,7 @@ class SystolicInterface(implicit p: Parameters) extends Module {
   io.core_inst_in          := io.instruction_in
   io.core_inst_valid_in    := io.instruction_valid_in
   io.core_pc_in            := io.pc_in
+
+  // 6. Global Stall Backpressure (combinational passthrough)
+  io.stall_out := io.core_stall_out
 }

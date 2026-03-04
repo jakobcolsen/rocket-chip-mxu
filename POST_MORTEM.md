@@ -39,7 +39,7 @@ Parallel memory modification by un-synchronized cores often leads to false-shari
 
 ## 4. Implemented Hardware Solutions
 
-The initial proof-of-concept relied on software mitigations (NOP runways, 8-store bursts) for pipeline desynchronization. These have since been replaced by clean hardware solutions:
+The initial proof-of-concept relied on software mitigations (NOP runways, 8-store bursts) for pipeline desynchronization. A subsequent attempt used a RoCC-based barrier bitmap, which failed due to D-cache replays flushing the barrier instruction itself. All of these have since been replaced by clean hardware solutions:
 
 ### i. Follower-Fetch PC Broadcast (Implemented)
 The Follower's Decode stage now receives the Leader's 64-bit Program Counter via `io.systolic_pc_in`, routed through the Systolic Mesh. The multiplexer `id_effective_pc = Mux(id_systolic_follower, io.systolic_pc_in, ibuf.io.pc)` ensures that `mepc` accurately tracks the SIMD payload during exceptions. The Follower's local I-Cache is frozen (`ibuf.io.inst(0).ready := ... && !id_systolic_follower`) so it can seamlessly resume local execution when SIMD mode is deactivated.
@@ -50,10 +50,24 @@ Followers no longer need to spin in active NOP loops. They sleep via the standar
 ### iii. Leader CSR Pipeline Flush (Implemented)
 The Leader no longer needs a NOP runway after `csrw 0x800`. A decode-stage signal `id_sys_csr_write` detects writes to address `0x800` and is OR'd into `id_csr_flush`. This triggers `ex_reg_flush_pipe`, killing the shadow pipeline behind the CSR write and guaranteeing the SIMD payload only enters the pipeline after the CSR has committed and the wakeup signal has propagated.
 
-### iv. Remaining Software Workarounds
-The SIMD payload in `hello_simd.c` still uses inter-instruction NOP gaps (`SIMD_GAP`) and redundant 8-store bursts within the payload body. These mitigate transient pipeline stalls and I-Cache refill latency on Followers during the broadcast window. A future hardware credit-based handshake (`systolic_ready` back-channel) would eliminate these entirely.
+### iv. Global Stall OR-Tree (Implemented — replaces NOP gaps, 8-store bursts, and barrier bitmap)
+The root cause of dropped instructions was identified: when a Follower's D-cache misses, the pipeline replays and flushes the in-flight instruction. Meanwhile, the Leader advanced and started broadcasting the *next* instruction. The Follower received this new instruction, permanently skipping the missed store.
+
+The fix is a **combinational OR-tree stall network**:
+*   Each core computes `ctrl_stalld_local` (all local hazards: D-cache miss, structural stall, scoreboard, etc.) and drives `systolic_stall_out` when it cannot accept the current instruction.
+*   The Mesh OR's all `systolic_stall_out` signals: `val global_stall = sys_outputs.map(_.systolic_stall_out).reduce(_ || _)`.
+*   `global_stall` is broadcast to every core's `systolic_stall` input, which is injected into `ctrl_stalld`: `val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable)`.
+*   This freezes the Leader's Decode stage so the broadcasted instruction stays on the wire until **all** Followers have digested it.
+*   **Combinational loop avoidance**: `systolic_stall_out` is driven from `ctrl_stalld_local` (no global feedback), not from `ctrl_stalld` (which includes the feedback). This breaks the `ctrl_stalld → stall_out → mesh → stall_in → ctrl_stalld` loop.
+
+The previous RoCC-based barrier bitmap (`WithSystolicRoCC`) has been removed from the configuration.
+
+### v. Scalability Notes
+*   **4–16 cores**: The combinational OR-tree is `log₂(N)` gate delays deep (~2–4 levels). Negligible compared to ALU or D-cache critical path.
+*   **64+ cores**: A registered hierarchical stall tree (grouping cores into sub-arrays) would be needed to meet timing at high clock frequencies. This adds ~1 cycle latency per tree level.
+*   **Performance**: The stall only fires on actual D-cache misses. For compute-heavy SIMD kernels (ALU-bound), it is essentially free. Compared to the old 16-NOP gaps per instruction, throughput is significantly improved.
 
 ---
 
 ## Conclusion
-The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, and CSR pipeline flushing eliminates Leader-side NOP delays. The remaining in-payload NOP gaps are a bounded workaround for broadcast-window stalls, addressable by a future hardware handshake mechanism.
+The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. The SIMD payload in `hello_simd.c` now uses a single `sb` instruction with zero NOP gaps — verified on 2026-03-04 with Verilator.

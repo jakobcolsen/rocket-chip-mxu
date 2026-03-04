@@ -96,18 +96,20 @@ if (c > 0) {
 ```
 - **What it does:** If the core is not on the left edge (`c > 0`), it reaches out to the tile sitting immediately to its left (`c - 1`), grabs its `east_out` bundle, and plugs it into its own `west_in` bundle using the `<>` (bulk connect) operator. 
 
-### Global Instruction & Stall Broadcast
+### Global Instruction Broadcast & Stall Network
 ```scala
-val global_stall = sys_outputs(0).systolic_master_ctrl
 val global_simd_mode = sys_outputs(0).systolic_simd_mode
 val global_instruction = sys_outputs(0).instruction
 ...
 if (r == 0 && c == 0) { ... } else {
-  curr_in.systolic_stall := global_stall
   curr_in.instruction := global_instruction
 }
+
+// Global Stall OR-Tree
+val global_stall = sys_outputs.map(_.systolic_stall_out).reduce(_ || _)
+sys_inputs.foreach(_.systolic_stall := global_stall)
 ```
-- **What it does:** Tile 0 is heavily hardcoded here as the "Leader" (the master controller). Its `output` ports for `instruction`, `simd_mode`, and `stall` are broadcast identically to the `input` ports of *every single other tile* in the array. This is the backbone of your SIMD lock-step feature!
+- **What it does:** Tile 0 is hardcoded as the "Leader". Its `instruction`, `simd_mode`, and `pc` output ports are broadcast identically to all other tiles. The stall signal uses a different mechanism: **every** core drives a `systolic_stall_out` signal when it encounters a local pipeline hazard (D-cache miss, structural stall, replay). The Mesh OR's all of these together into `global_stall` and broadcasts it back to **all** cores, including the Leader. This freezes the entire array until the straggler core catches up, guaranteeing that no broadcasted instruction is ever dropped.
 
 ---
 
@@ -246,7 +248,23 @@ ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systoli
 ```
 - **What it does:** The standard Rocket Chip will "kill" an instruction (flush it from the pipeline) if the Instruction Buffer marks it for "replay" (meaning the cache wasn't ready). Because Followers freeze their `ibuf`, it often stays in a "replay" state eternally. The added `&& !id_systolic_follower` ensures that Followers ignore their local freeze state and execute the broadcasted instruction anyway.
 
-### G. Broadcasting from the Leader
+### G. Global Stall Backpressure
+When a Follower's D-cache misses, the pipeline replays and flushes the in-flight instruction. Without backpressure, the Leader would advance and broadcast the *next* instruction, causing the Follower to permanently skip the missed store.
+
+```scala
+// Local stall (no global feedback — breaks combinational loop)
+val ctrl_stalld_local = id_ex_hazard || id_mem_hazard || ... || io.traceStall
+
+// Full stall includes global feedback
+val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable)
+
+// Drive stall from local conditions only
+io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb)
+```
+- **What it does:** Each core computes `ctrl_stalld_local` (all local hazards, cache misses, fences, etc.) and drives `systolic_stall_out` when it cannot accept the current instruction. The Mesh OR's these signals across all cores and feeds the result back into every core's `ctrl_stalld` via `io.systolic_stall`. This freezes the Leader's Decode stage so the instruction stays on the wire until all Followers have digested it.
+- **Why the split?** If `systolic_stall_out` depended on `ctrl_stalld` (which includes the global stall input), we would create a combinational loop: `ctrl_stalld → stall_out → mesh OR → stall_in → ctrl_stalld`. By computing `stall_out` from `ctrl_stalld_local` only, the loop is broken.
+
+### H. Broadcasting from the Leader
 ```scala
 io.systolic_instruction_out := id_inst(0)
 io.systolic_instruction_valid_out := is_leader && !ctrl_killd
@@ -264,6 +282,7 @@ io.systolic_pc_out := ibuf.io.pc
 5. **Core 0** executes an instruction (e.g., `sb t2, 0(t1)`).
 6. As that instruction passes through Core 0's **Decode** stage, it is broadcast out onto the mesh via `systolic_instruction_out`.
 7. **Cores 1-3** receive the instruction through `id_effective_inst` and execute it precisely in lock-step. Each core reads its own `mhartid` and computes a unique store address, proving independent data with synchronized control.
+8. If **any core** encounters a D-cache miss or pipeline hazard, it asserts `systolic_stall_out`. The Mesh OR's all stall signals and broadcasts `global_stall` back to every core, freezing the Leader's Decode stage until the straggler catches up. No instructions are ever dropped.
 
 ---
 
@@ -313,5 +332,5 @@ firesim runworkload
 ```
 
 > [!TIP]
-> **Verified on 2026-02-25** with Verilator `VerilatorQuadRocketMXUConfig`. All 4 cores wrote `'A'+hartid` to `shared_results[hartid]`, producing `A`, `B`, `C`, `D` in lockstep. See [walkthrough.md](file:///home/jolsen16/.gemini/antigravity/brain/b10fb699-18a6-46d2-a46b-37ba629f065b/walkthrough.md) for full results.
+> **Verified on 2026-03-04** with Verilator `VerilatorQuadRocketMXUConfig`. All 4 cores wrote `'A'+hartid` to `shared_results[hartid]`, producing `A`, `B`, `C`, `D` in lockstep — with **zero NOP gaps** and a **single store** per core, thanks to the global stall OR-tree.
 

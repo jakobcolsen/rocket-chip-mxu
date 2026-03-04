@@ -169,6 +169,7 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
 
     // Systolic Control/Data
     val systolic_stall       = Input(Bool())
+    val systolic_stall_out   = Output(Bool())  // Global stall backpressure
     val systolic_enable      = Input(Bool())
     val systolic_opA         = Input(UInt(xLen.W))
     val systolic_opB         = Input(UInt(xLen.W))
@@ -1158,7 +1159,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val rocc_blocked = Reg(Bool())
   rocc_blocked := !wb_xcpt && !io.rocc.cmd.ready && (io.rocc.cmd.valid || rocc_blocked)
 
-  val ctrl_stalld =
+  // Local stall conditions (no global stall feedback — breaks combinational loop)
+  val ctrl_stalld_local =
     id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard ||
     id_vconfig_hazard ||
     csr.io.singleStep && (ex_reg_valid || mem_reg_valid || wb_reg_valid) ||
@@ -1173,8 +1175,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     csr.io.csr_stall && !io.systolic_enable ||
     id_reg_pause ||
     io.traceStall
+
+  // Full stall includes global stall feedback (freezes Decode when any core is behind)
+  val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable)
+
   // [Fix A] Mask perma-kill from frozen IBuf replay
   ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
+
+  // Drive global stall backpressure from LOCAL conditions only (no loop)
+  io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb)
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -1298,7 +1307,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.wfi := csr.io.status.wfi && !io.systolic_enable
   if (rocketParams.clockGate) {
     long_latency_stall := (csr.io.csr_stall && !io.systolic_enable) || io.dmem.perf.blocked || id_reg_pause && !unpause
-    clock_en := (clock_en_reg || ex_pc_valid || (!long_latency_stall && io.imem.resp.valid)) && !io.systolic_stall
+    clock_en := (clock_en_reg || ex_pc_valid || (!long_latency_stall && io.imem.resp.valid))
     clock_en_reg :=
       ex_pc_valid || mem_pc_valid || wb_pc_valid || // instruction in flight
       io.ptw.customCSRs.disableCoreClockGate || // chicken bit

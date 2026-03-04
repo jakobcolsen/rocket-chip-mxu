@@ -49,13 +49,6 @@ SECTIONS
   }
   .bss : { *(.bss); . = ALIGN(16); }
 
-  /* Dedicated shared memory area for SIMD results */
-  . = ALIGN(0x1000);
-  .shared_mem : {
-    _shared_results = .;
-    . = . + 0x1000; /* 4KB of space */
-  }
-
   /* thread-local data segment */
   .tdata :
   {
