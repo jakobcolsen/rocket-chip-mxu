@@ -19,9 +19,10 @@ rocketchip.jar
 # Compilation Artifacts
 *.o
 *.d
-*.riscv*
+*.riscv
 *.hex
 *.dump
+*.objdump
 
 # Logs and Simulation Files
 *.log
@@ -29,6 +30,8 @@ rocketchip.jar
 *.vpd
 *.vcd
 uart_output.txt
+*.txt
+*.err
 
 # Specific temporary files
 sim_trace*.log

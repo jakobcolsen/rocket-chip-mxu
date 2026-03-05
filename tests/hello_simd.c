@@ -50,8 +50,7 @@ int main(void) {
         // Each instruction is held by the Leader until all Followers have consumed it.
         asm volatile(
             "csrr t0, mhartid   \n\t"
-            "lui  t1, %%hi(shared_results) \n\t"
-            "addi t1, t1, %%lo(shared_results) \n\t"
+            "la   t1, shared_results \n\t"
             "slli t3, t0, 6     \n\t"
             "add  t1, t1, t3    \n\t"
             "li   t2, 'A'       \n\t"

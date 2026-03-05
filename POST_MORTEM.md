@@ -62,12 +62,24 @@ The fix is a **combinational OR-tree stall network**:
 
 The previous RoCC-based barrier bitmap (`WithSystolicRoCC`) has been removed from the configuration.
 
-### v. Scalability Notes
+### v. D-Cache Contention Livelock Padding (Implemented)
+During lock-step execution, overlapping cache misses from multiple cores interacting with the same cache line led to infinite coherence livelocks. The leader and followers effectively deadlocked each other from acquiring write permissions. This was resolved by structurally padding shared memory arrays (e.g., SIMD result buffers) to ensure each core's target memory resides in an isolated 64-byte shifted block, completely neutralizing false-sharing and contention races.
+
+### vi. Custom CSR Mesh Wiring and PTW Override Fix (Implemented)
+Custom CSRs `0x801` and `0x802` were originally masked to strictly 0 internally, preventing them from catching dynamic values from the mesh `sdata` pins. After setting their Chisel masks to `BigInt("FFFFFFFFFFFFFFFF", 16)`, a secondary issue was found where the `csr.io.customCSRs` bundle inputs were being overwritten by false defaults from a bidirectional `<>` connection to the Page Table Walker (PTW). The fix explicitly wires the PTW connection uni-directionally, preserving the dynamic mesh data inputs and enabling dynamic hardware-to-software data routing.
+
+### vii. Scalability Notes
 *   **4–16 cores**: The combinational OR-tree is `log₂(N)` gate delays deep (~2–4 levels). Negligible compared to ALU or D-cache critical path.
 *   **64+ cores**: A registered hierarchical stall tree (grouping cores into sub-arrays) would be needed to meet timing at high clock frequencies. This adds ~1 cycle latency per tree level.
 *   **Performance**: The stall only fires on actual D-cache misses. For compute-heavy SIMD kernels (ALU-bound), it is essentially free. Compared to the old 16-NOP gaps per instruction, throughput is significantly improved.
 
 ---
 
-## Conclusion
-The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. The SIMD payload in `hello_simd.c` now uses a single `sb` instruction with zero NOP gaps — verified on 2026-03-04 with Verilator.
+## 5. Future Work
+
+### i. Decoupling Front-End from Execution (The "Ideal" Fix)
+
+A fundamentally more robust (but more complex) solution would be to decouple the instruction fetch/decode stage from the execution stages using an instruction FIFO. This would allow the Leader to fetch ahead while the Followers (or the Leader itself) deal with asynchronous memory latencies. In this model, the "lockstep" would be enforced at the point of issue from the FIFO, rather than at the point of broadcast. This would eliminate the need for instantaneous global stall/replay trees and simplify timing closure for large-scale FPGA deployments (4x4 or 8x8 meshes), though it would require a significant overhaul of the Rocket pipeline's control logic.
+
+## 6. Conclusion
+The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. Memory contention has been structurally isolated via cache-line padding, and Custom CSRs dynamically expose real-time mesh data to the executable cores. The SIMD payload now streams seamlessly with zero NOP gaps — fully verified on 2026-03-05 with Verilator.

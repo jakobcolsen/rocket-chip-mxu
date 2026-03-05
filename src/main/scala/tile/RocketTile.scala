@@ -171,14 +171,15 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       
       // 1. Wire to External Mesh (Diplomatic IOs)
       // Inputs from Mesh -> Interface
-      systolic_if.io.west_in          <> systolic_in_io.west_in
-      systolic_if.io.north_in         <> systolic_in_io.north_in
+      systolic_if.io.west_in          := systolic_in_io.west_in
+      systolic_if.io.north_in         := systolic_in_io.north_in
       systolic_if.io.systolic_enable  := systolic_in_io.systolic_enable
       systolic_if.io.systolic_stall   := systolic_in_io.systolic_stall
+      systolic_if.io.systolic_replay  := systolic_in_io.systolic_replay
 
       // Outputs from Interface -> Mesh
-      systolic_out_io.east_out        <> systolic_if.io.east_out
-      systolic_out_io.south_out       <> systolic_if.io.south_out
+      systolic_out_io.east_out        := systolic_if.io.east_out
+      systolic_out_io.south_out       := systolic_if.io.south_out
       systolic_out_io.instruction     := systolic_if.io.instruction_out
       systolic_out_io.instruction_valid := systolic_if.io.instruction_valid_out
       systolic_out_io.pc              := systolic_if.io.pc_out
@@ -188,6 +189,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_opB          := systolic_if.io.alu_opB
       core.io.systolic_enable       := systolic_in_io.systolic_enable
       core.io.systolic_stall        := systolic_in_io.systolic_stall
+      core.io.systolic_replay_in    := systolic_in_io.systolic_replay
       systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
       systolic_out_io.systolic_simd_mode   := core.io.systolic_simd_mode_out
       
@@ -202,17 +204,22 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_instruction_valid_in := systolic_if.io.core_inst_valid_in
       core.io.systolic_pc_in             := systolic_if.io.core_pc_in
 
-      // 3. Wire Core Data Injection (For Software Mesh Control)
-      systolic_if.io.core_data_in   := core.io.systolic_data_out
-      systolic_if.io.core_data_wen  := core.io.systolic_data_wen
+      // 3. Wire Core Data Write Ports (CSR-driven shift register writes)
+      systolic_if.io.core_east_data  := core.io.systolic_data_out       // CSR 0x801 write → East
+      systolic_if.io.core_east_wen   := core.io.systolic_data_wen
+      systolic_if.io.core_south_data := core.io.systolic_south_data_out // CSR 0x802 write → South
+      systolic_if.io.core_south_wen  := core.io.systolic_south_data_wen
 
-      // 4. Wire Global Stall Backpressure
+      // 4. Wire Global Stall & Replay Backpressure
       systolic_if.io.core_stall_out := core.io.systolic_stall_out
       systolic_out_io.systolic_stall_out := systolic_if.io.stall_out
+      systolic_if.io.core_replay_out := core.io.systolic_replay_out
+      systolic_out_io.systolic_replay_out := systolic_if.io.replay_out
   } else {
       // Tie off core systolic ports if needed, or leave disconnected if strictly input
       core.io.systolic_enable := false.B
       core.io.systolic_stall  := false.B
+      core.io.systolic_replay_in := false.B
       core.io.systolic_opA    := 0.U
       core.io.systolic_opB    := 0.U
       core.io.systolic_instruction_in := 0.U

@@ -124,15 +124,20 @@ class RocketCustomCSRs(implicit p: Parameters) extends CustomCSRs with HasRocket
   // Systolic Control CSR (Head Node Control)
   def systolicCSR = CustomCSR(0x800, BigInt(3), Some(BigInt(0))) // Address 0x800, Bit 0 & 1 writable
 
-  // Systolic Data CSR (Data Exchange)
-  def systolicDataCSR = CustomCSR(0x801, BigInt(0), Some(BigInt(0)))
+  // Systolic Data CSR: West/East axis (read West register, write East register)
+  def systolicDataCSR = CustomCSR(0x801, BigInt("FFFFFFFFFFFFFFFF", 16), Some(BigInt(0)))
+
+  // Systolic Data CSR: North/South axis (read North register, write South register)
+  def systolicDataCSR_NS = CustomCSR(0x802, BigInt("FFFFFFFFFFFFFFFF", 16), Some(BigInt(0)))
 
   def systolicMasterCtrl = getByIdOrElse(0x800, _.value(0), false.B)
   def systolicSimdMode   = getByIdOrElse(0x800, _.value(1), false.B)
   def systolicDataOut    = getByIdOrElse(0x801, _.wdata, 0.U)
   def systolicDataWen    = getByIdOrElse(0x801, _.wen, false.B)
+  def systolicSouthOut   = getByIdOrElse(0x802, _.wdata, 0.U)
+  def systolicSouthWen   = getByIdOrElse(0x802, _.wen, false.B)
 
-  override def decls = super.decls :+ marchid :+ mvendorid :+ mimpid :+ systolicCSR :+ systolicDataCSR
+  override def decls = super.decls :+ marchid :+ mvendorid :+ mimpid :+ systolicCSR :+ systolicDataCSR :+ systolicDataCSR_NS
 
 }
 
@@ -170,13 +175,17 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     // Systolic Control/Data
     val systolic_stall       = Input(Bool())
     val systolic_stall_out   = Output(Bool())  // Global stall backpressure
+    val systolic_replay_in   = Input(Bool())   // Global replay synchronization
+    val systolic_replay_out  = Output(Bool())  // Local replay request
     val systolic_enable      = Input(Bool())
     val systolic_opA         = Input(UInt(xLen.W))
     val systolic_opB         = Input(UInt(xLen.W))
     val systolic_master_ctrl = Output(Bool())
     val systolic_simd_mode_out = Output(Bool()) // [Fix A] Broadcast Leader Mode
-    val systolic_data_out    = Output(UInt(xLen.W))
-    val systolic_data_wen    = Output(Bool())
+    val systolic_data_out    = Output(UInt(xLen.W))   // East write data (CSR 0x801)
+    val systolic_data_wen    = Output(Bool())         // East write-enable
+    val systolic_south_data_out = Output(UInt(xLen.W)) // South write data (CSR 0x802)
+    val systolic_south_data_wen = Output(Bool())       // South write-enable
 
 
   })
@@ -378,6 +387,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.systolic_simd_mode_out := customCSRs.systolicSimdMode // Drive output from CSR
   io.systolic_data_out    := customCSRs.systolicDataOut
   io.systolic_data_wen    := customCSRs.systolicDataWen
+  io.systolic_south_data_out := customCSRs.systolicSouthOut
+  io.systolic_south_data_wen := customCSRs.systolicSouthWen
 
   val id_effective_expanded_inst = id_expanded_inst(0)
   val id_effective_inst = Mux(id_systolic_follower, io.systolic_instruction_in, id_inst(0))
@@ -401,7 +412,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.fence_i := false.B
     id_ctrl.amo := false.B
     id_ctrl.fp := false.B
-    id_ctrl.mul := false.B
+    // id_ctrl.mul := false.B  // Allow MUL for systolic MAC
     id_ctrl.div := false.B
     id_ctrl.rocc := false.B
     id_ctrl.vec := false.B
@@ -437,10 +448,18 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     lhs.wdata := rhs.wdata
     
     if (decl.id == 0x801) {
-      rhs.sdata := io.systolic_opA
+      rhs.sdata := io.systolic_opA   // Read: West shift register value
       rhs.set := true.B // Always reflect mesh data on read
       rhs.stall := false.B
       
+      lhs.stall := false.B
+      lhs.set := false.B
+      lhs.sdata := 0.U
+    } else if (decl.id == 0x802) {
+      rhs.sdata := io.systolic_opB   // Read: North shift register value
+      rhs.set := true.B // Always reflect mesh data on read
+      rhs.stall := false.B
+
       lhs.stall := false.B
       lhs.set := false.B
       lhs.sdata := 0.U
@@ -887,7 +906,20 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_wb_rocc = wb_reg_valid && wb_ctrl.rocc && !io.rocc.cmd.ready
   val replay_wb_csr: Bool = wb_reg_valid && csr.io.rw_stall
   val replay_wb_vec = wb_reg_valid && io.vector.map(_.wb.replay).getOrElse(false.B)
-  val replay_wb = replay_wb_common || replay_wb_rocc || replay_wb_csr || replay_wb_vec
+  
+  // [Global Replay] Separate local trigger from global result to avoid loops
+  // Multi-driver fix: local_replay_req is used by systolic_replay_out
+  val local_replay_req = (replay_wb_common || replay_wb_rocc || replay_wb_csr || replay_wb_vec) && !wb_xcpt
+  io.systolic_replay_out := local_replay_req && io.systolic_enable
+  
+  val global_replay_wb = io.systolic_replay_in && io.systolic_enable
+  val replay_wb = local_replay_req || global_replay_wb
+  
+  when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
+    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d csr_stall=%d\n",
+      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, csr.io.rw_stall)
+  }
+  
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
   // writeback arbitration
@@ -1032,7 +1064,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.ptw.ptbr := csr.io.ptbr
   io.ptw.hgatp := csr.io.hgatp
   io.ptw.vsatp := csr.io.vsatp
-  (io.ptw.customCSRs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
+  (io.ptw.customCSRs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => 
+    lhs.ren := rhs.ren
+    lhs.wen := rhs.wen
+    lhs.wdata := rhs.wdata
+    lhs.value := rhs.value
+    rhs.stall := lhs.stall
+    // Do not wire PTW's set/sdata inputs; RocketCore will manually drive them later.
+    // If not driven later, they will default to false/0.
+  }
   io.ptw.status := csr.io.status
   io.ptw.hstatus := csr.io.hstatus
   io.ptw.gstatus := csr.io.gstatus
@@ -1315,6 +1355,17 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       usingFPU.B && !io.fpu.fcsr_rdy || // long-latency FPU in flight
       io.dmem.replay_next || // long-latency load replaying
       (!long_latency_stall && (ibuf.io.inst(0).valid || io.imem.resp.valid)) // instruction pending
+
+    io.systolic_stall_out := (dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
+      io.dmem.replay_next || // long-latency load replaying
+      take_pc_wb || // pipeline flushes (eret, branch redirects)
+      csr.io.interrupt       // async interrupts
+    ))
+
+    when (io.systolic_enable && (io.systolic_stall_out || io.systolic_stall)) {
+      printf("C%d SYSTOLIC STALL pc=[%x] out=%d in=%d dcache_blk=%d local_req=%d\n",
+        io.hartid, wb_reg_pc, io.systolic_stall_out, io.systolic_stall, dcache_blocked, local_replay_req)
+    }
 
     assert(!(ex_pc_valid || mem_pc_valid || wb_pc_valid) || clock_en)
   }
