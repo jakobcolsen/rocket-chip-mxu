@@ -1,0 +1,17 @@
+diff --git a/generators/chipyard/src/main/scala/DigitalTop.scala b/generators/chipyard/src/main/scala/DigitalTop.scala
+index c4fa17aa..e1c20367 100644
+--- a/generators/chipyard/src/main/scala/DigitalTop.scala
++++ b/generators/chipyard/src/main/scala/DigitalTop.scala
+@@ -40,10 +40,12 @@ class DigitalTop(implicit p: Parameters) extends ChipyardSystem
+   with fftgenerator.CanHavePeripheryFFT // Enables optionally having an MMIO-based FFT block
+   with constellation.soc.CanHaveGlobalNoC // Support instantiating a global NoC interconnect
+   with rerocc.CanHaveReRoCCTiles // Support tiles that instantiate rerocc-attached accelerators
++  with chipyard.HasSystolicMesh // Added systolic mesh trait
+ {
+   override lazy val module = new DigitalTopModule(this)
+ }
+ 
+ class DigitalTopModule(l: DigitalTop) extends ChipyardSystemModule(l)
+   with freechips.rocketchip.util.DontTouch
++  with chipyard.HasSystolicMeshModule // Added systolic mesh module trait
+ // DOC include end: DigitalTop

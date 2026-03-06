@@ -24,6 +24,33 @@ The software side involves cross-compiling your C tests (like `hello_simd.c`) to
 3. **The Boot Sequence**: Upon processor reset, Rocket fetches its very first instructions from an internal, hardcoded BootROM located at memory address `0x10000`. The code inside the BootROM essentially wakes up the cores, puts followers (Harts 1-15) to sleep in a WFI (Wait For Interrupt) loop, and tells Hart 0 (the leader) to jump to the user payload lying in DRAM at `0x80000000`. 
    *(Note: We originally attempted bypassing this BootROM by overriding the reset vector, but standard BootROM sequencing proved necessary to properly initialize peripheral and pipeline states safely).*
 
+### C. The Chipyard Overlay (Two-Repo Architecture)
+Your project spans **two repositories** that are stitched together at build time:
+
+1. **`rocket-chip-mxu/`** — Your fork of Rocket Chip. Contains all modifications to the CPU pipeline (`RocketCore.scala`), tile integration (`RocketTile.scala`), the systolic interface (`SystolicInterface.scala`), custom CSRs, and bare-metal test code (`tests/`).
+2. **`chipyard/`** — The SoC framework that instantiates Rocket Chip as a generator and wraps it with buses, peripherals, and simulation harnesses.
+
+**The Symlink**: Chipyard expects its Rocket Chip source at `chipyard/generators/rocket-chip/`. This directory is a **symlink** pointing to your `rocket-chip-mxu/` checkout:
+```
+chipyard/generators/rocket-chip → /home/jolsen16/rocket-chip-mxu
+```
+This means any edits to `rocket-chip-mxu/src/` are immediately visible to Chipyard's build system — no copy step required.
+
+**The Overlay Directory**: Some files must live inside `chipyard/generators/chipyard/` (because they reference Chipyard-specific classes like `ChipyardSystem`). These are tracked in `rocket-chip-mxu/chipyard-overlay/`:
+```
+chipyard-overlay/
+├── deploy.sh                       # Copies overlay files into a Chipyard workspace
+└── generators/chipyard/src/main/scala/
+    ├── SystolicConfigs.scala        # Config fragments (WithSystolicEnabled, etc.)
+    ├── SystolicMesh.scala           # Top-level 2D mesh wiring + OR-trees
+    └── DigitalTop.scala.patch       # Mixes HasSystolicMesh into DigitalTop
+```
+
+**Deploying the Overlay**: Run `./chipyard-overlay/deploy.sh /path/to/chipyard` to copy `SystolicConfigs.scala` and `SystolicMesh.scala` into Chipyard and apply the `DigitalTop.scala.patch`. If the patch is already applied, it is safely skipped. After deployment, `chipyard/generators/chipyard/src/main/scala/` contains both the stock Chipyard code and your systolic extensions side by side.
+
+> [!TIP]
+> The original, unmodified Rocket Chip source is backed up at `chipyard/generators/rocket-chip.bak/` in case you need to diff or revert.
+
 ---
 
 ## 🏗️ 2. High Level Architecture
