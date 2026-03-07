@@ -913,11 +913,28 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.systolic_replay_out := local_replay_req && io.systolic_enable
   
   val global_replay_wb = io.systolic_replay_in && io.systolic_enable
-  val replay_wb = local_replay_req || global_replay_wb
+
+  // --- HartID-Based Replay Backoff (breaks D-cache contention livelock) ---
+  // When a global replay fires during SIMD, each core delays its retry by
+  // (hartid+1)*K cycles.  This deterministic stagger prevents all cores from
+  // hitting the same cache line simultaneously on retry.
+  val K_BACKOFF = 8
+  val replay_backoff_ctr = RegInit(0.U(8.W))
+  val replay_backoff_active = replay_backoff_ctr > 0.U
+
+  when (global_replay_wb && !replay_backoff_active) {
+    replay_backoff_ctr := (io.hartid +& 1.U) * K_BACKOFF.U
+  }.elsewhen (replay_backoff_active) {
+    replay_backoff_ctr := replay_backoff_ctr - 1.U
+  }
+
+  // Local replays fire immediately; global replays are delayed by the backoff.
+  // Outside of SIMD mode, no change to existing behavior.
+  val replay_wb = local_replay_req || (global_replay_wb && !replay_backoff_active)
   
   when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
-    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d csr_stall=%d\n",
-      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, csr.io.rw_stall)
+    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d csr_stall=%d backoff=%d\n",
+      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, csr.io.rw_stall, replay_backoff_ctr)
   }
   
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe

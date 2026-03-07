@@ -4,7 +4,7 @@
 
 #define MSTATUS_MIE 0x00000008
 
-volatile char shared_results[4][64] __attribute__((aligned(64)));
+volatile char shared_results[4] __attribute__((aligned(64)));
 volatile int core_ready[16] = {0};
 
 void thread_entry(int cid, int nc) {
@@ -32,13 +32,13 @@ int main(void) {
         printf("It's a party in here!\n");
         
         for (int i = 0; i < 4; i++) {
-            shared_results[i][0] = (i == 0) ? 0 : 'Z';
+            shared_results[i] = (i == 0) ? 0 : 'Z';
         }
         asm volatile("fence rw, rw" ::: "memory");
 
         printf("Array state BEFORE SIMD (Fixed Base: %p):\n", shared_results);
         for (int i = 0; i < 4; i++) {
-            printf("  Slot %d: 0x%02x\n", i, (unsigned char)shared_results[i][0]);
+            printf("  Slot %d: 0x%02x\n", i, (unsigned char)shared_results[i]);
         }
 
         printf("ACTIVATING SYSTOLIC SIMD (CSR 0x800)\n");
@@ -51,7 +51,7 @@ int main(void) {
         asm volatile(
             "csrr t0, mhartid   \n\t"
             "la   t1, shared_results \n\t"
-            "slli t3, t0, 6     \n\t"
+            "slli t3, t0, 0     \n\t"
             "add  t1, t1, t3    \n\t"
             "li   t2, 'A'       \n\t"
             "add  t2, t2, t0    \n\t"
@@ -70,7 +70,7 @@ int main(void) {
         int passed = 1;
         for (int i = 0; i < 4; i++) {
             char expected = 'A' + i;
-            char actual = shared_results[i][0];
+            char actual = shared_results[i];
             printf("  Slot %d: '%c' (0x%02x)\n", i, actual, (unsigned char)actual);
             if (actual != expected) passed = 0;
         }
