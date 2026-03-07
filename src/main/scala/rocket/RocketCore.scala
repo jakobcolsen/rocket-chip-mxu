@@ -358,6 +358,36 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val is_leader = io.hartid === 0.U
   val id_systolic_follower = io.systolic_enable && !is_leader
 
+  // --- HartID-Based D-Cache Contention Backoff ---
+  // When a D-cache nack occurs during SIMD, each core delays its retry by
+  // (hartid+1)*K cycles at the Decode stage.  When the backoff expires, the
+  // core temporarily ignores the global stall OR-tree to retry the store
+  // alone (no contention).  After commit, it re-joins lockstep.
+  val K_BACKOFF = 8
+  val simd_dcache_backoff = RegInit(0.U(8.W))
+  val simd_dcache_backoff_active = simd_dcache_backoff > 0.U
+  val simd_retry_inflight = RegInit(false.B)
+
+  // Load backoff on D-cache nack during SIMD; count down otherwise
+  when (io.systolic_enable && io.dmem.s2_nack) {
+    simd_dcache_backoff := (io.hartid +& 1.U) * K_BACKOFF.U
+    simd_retry_inflight := false.B
+  }.elsewhen (simd_dcache_backoff_active) {
+    simd_dcache_backoff := simd_dcache_backoff - 1.U
+  }
+
+  // When backoff expires → enter retry mode (one-shot rising edge)
+  when (io.systolic_enable && !simd_dcache_backoff_active && RegNext(simd_dcache_backoff_active) && !simd_retry_inflight) {
+    simd_retry_inflight := true.B
+  }
+  // Retry mode clears when the store commits at WB
+  val simd_retry_override = simd_retry_inflight && io.systolic_enable
+
+  when (io.systolic_enable && (simd_dcache_backoff_active || simd_retry_inflight)) {
+    printf("C%d SIMD_BACKOFF t=%d backoff=%d inflight=%d nack=%d\n",
+      io.hartid, csr.io.time(31,0), simd_dcache_backoff, simd_retry_inflight, io.dmem.s2_nack)
+  }
+
   val take_pc_mem_wb = take_pc_wb || take_pc_mem
   // [Fix C] Mask take_pc for followers to prevent them from "following" leader's jumps/branches
   // and escaping their local spin-loops.
@@ -908,33 +938,20 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_wb_vec = wb_reg_valid && io.vector.map(_.wb.replay).getOrElse(false.B)
   
   // [Global Replay] Separate local trigger from global result to avoid loops
-  // Multi-driver fix: local_replay_req is used by systolic_replay_out
   val local_replay_req = (replay_wb_common || replay_wb_rocc || replay_wb_csr || replay_wb_vec) && !wb_xcpt
   io.systolic_replay_out := local_replay_req && io.systolic_enable
   
   val global_replay_wb = io.systolic_replay_in && io.systolic_enable
+  val replay_wb = local_replay_req || global_replay_wb
 
-  // --- HartID-Based Replay Backoff (breaks D-cache contention livelock) ---
-  // When a global replay fires during SIMD, each core delays its retry by
-  // (hartid+1)*K cycles.  This deterministic stagger prevents all cores from
-  // hitting the same cache line simultaneously on retry.
-  val K_BACKOFF = 8
-  val replay_backoff_ctr = RegInit(0.U(8.W))
-  val replay_backoff_active = replay_backoff_ctr > 0.U
-
-  when (global_replay_wb && !replay_backoff_active) {
-    replay_backoff_ctr := (io.hartid +& 1.U) * K_BACKOFF.U
-  }.elsewhen (replay_backoff_active) {
-    replay_backoff_ctr := replay_backoff_ctr - 1.U
+  // Clear simd_retry_inflight when the retried store commits successfully at WB
+  when (simd_retry_inflight && wb_reg_valid && wb_ctrl.mem && !replay_wb && !wb_xcpt) {
+    simd_retry_inflight := false.B
   }
 
-  // Local replays fire immediately; global replays are delayed by the backoff.
-  // Outside of SIMD mode, no change to existing behavior.
-  val replay_wb = local_replay_req || (global_replay_wb && !replay_backoff_active)
-  
   when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
-    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d csr_stall=%d backoff=%d\n",
-      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, csr.io.rw_stall, replay_backoff_ctr)
+    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d csr_stall=%d\n",
+      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, csr.io.rw_stall)
   }
   
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
@@ -1217,6 +1234,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   rocc_blocked := !wb_xcpt && !io.rocc.cmd.ready && (io.rocc.cmd.valid || rocc_blocked)
 
   // Local stall conditions (no global stall feedback — breaks combinational loop)
+  // During simd_retry_override, suppress dcache_blocked so the retrying core
+  // can re-issue its store without being held back by the blocked flag.
   val ctrl_stalld_local =
     id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard ||
     id_vconfig_hazard ||
@@ -1224,23 +1243,27 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_csr_en && csr.io.decode(0).fp_csr && !io.fpu.fcsr_rdy ||
     id_csr_en && csr.io.decode(0).vector_csr && id_vec_busy ||
     id_ctrl.fp && id_stall_fpu ||
-    id_ctrl.mem && dcache_blocked || // reduce activity during D$ misses
+    (id_ctrl.mem && dcache_blocked && !simd_retry_override) || // suppress during retry
     id_ctrl.rocc && rocc_blocked || // reduce activity while RoCC is busy
     id_ctrl.div && (!(div.io.req.ready || (div.io.resp.valid && !wb_wxd)) || div.io.req.valid) || // reduce odds of replay
     !clock_en ||
     id_do_fence ||
     csr.io.csr_stall && !io.systolic_enable ||
     id_reg_pause ||
-    io.traceStall
+    io.traceStall ||
+    (simd_dcache_backoff_active && id_ctrl.mem && io.systolic_enable)  // backoff stall
 
   // Full stall includes global stall feedback (freezes Decode when any core is behind)
-  val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable)
+  // During simd_retry_override, ignore the global stall so this core alone can
+  // proceed with the contested store while all other cores remain frozen.
+  val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable && !simd_retry_override)
 
   // [Fix A] Mask perma-kill from frozen IBuf replay
   ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 
   // Drive global stall backpressure from LOCAL conditions only (no loop)
-  io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb)
+  // Include backoff/inflight states so other cores stay frozen during this core's retry.
+  io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb || simd_dcache_backoff_active || simd_retry_inflight)
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -1263,7 +1286,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.imem.sfence.bits.hg := wb_reg_hfence_g
   io.ptw.sfence := io.imem.sfence
 
-  ibuf.io.inst(0).ready := !ctrl_stalld && !id_systolic_follower
+  // During simd_retry_override, freeze the leader's ibuf so it doesn't
+  // advance past the contested instruction while the store is in flight.
+  ibuf.io.inst(0).ready := !ctrl_stalld && !id_systolic_follower && !simd_retry_override
 
   io.imem.btb_update.valid := mem_reg_valid && !take_pc_wb && mem_wrong_npc && (!mem_cfi || mem_cfi_taken)
   io.imem.btb_update.bits.isValid := mem_cfi
@@ -1373,7 +1398,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       io.dmem.replay_next || // long-latency load replaying
       (!long_latency_stall && (ibuf.io.inst(0).valid || io.imem.resp.valid)) // instruction pending
 
-    io.systolic_stall_out := (dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
+    io.systolic_stall_out := (dcache_blocked && !local_replay_req) || simd_dcache_backoff_active || simd_retry_inflight || (io.systolic_master_ctrl && (
       io.dmem.replay_next || // long-latency load replaying
       take_pc_wb || // pipeline flushes (eret, branch redirects)
       csr.io.interrupt       // async interrupts
