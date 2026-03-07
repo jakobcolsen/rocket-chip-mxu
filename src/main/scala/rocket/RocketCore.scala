@@ -915,30 +915,29 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val global_replay_wb = io.systolic_replay_in && io.systolic_enable
 
   // --- HartID-Based Replay Backoff (breaks D-cache contention livelock) ---
-  // When a global replay fires during SIMD, each core delays its retry by
-  // (hartid+1)*K cycles.  This deterministic stagger prevents all cores from
-  // hitting the same cache line simultaneously on retry.
+  // When a core nacks during SIMD, it loads a hartid-proportional delay into
+  // a counter.  The counter stalls the core's OWN Decode stage (via
+  // ctrl_stalld_local), NOT the global stall network.  This makes cores
+  // re-enter the pipeline at staggered times so they arrive at WB at
+  // different cycles, eliminating simultaneous cache-line contention.
   val K_BACKOFF = 8
   val replay_backoff_ctr = RegInit(0.U(8.W))
   val replay_backoff_active = replay_backoff_ctr > 0.U
 
-  when (global_replay_wb && !replay_backoff_active) {
-    replay_backoff_ctr := (io.hartid +& 1.U) * K_BACKOFF.U
+  when (io.systolic_enable && local_replay_req && !replay_backoff_active) {
+    replay_backoff_ctr := io.hartid * K_BACKOFF.U  // Hart 0 = 0 (retries first)
   }.elsewhen (replay_backoff_active) {
     replay_backoff_ctr := replay_backoff_ctr - 1.U
   }
 
-  // During SIMD, suppress ALL replays (including local nacks) while backoff
-  // is active.  The nacked instruction is safely held in WB via wb_reg_replay
-  // until this core's hartid-proportional turn arrives.
-  // Outside of SIMD mode, no change to existing behavior.
-  val replay_wb = Mux(io.systolic_enable && replay_backoff_active,
-                      false.B,
-                      local_replay_req || global_replay_wb)
+  // replay_wb unchanged — local nacks and global replays fire normally.
+  // The stagger comes from the Decode-stage backoff above, not from
+  // suppressing replay_wb.
+  val replay_wb = local_replay_req || global_replay_wb
   
   when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
-    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d csr_stall=%d backoff=%d\n",
-      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, csr.io.rw_stall, replay_backoff_ctr)
+    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d nack=%d backoff=%d\n",
+      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, io.dmem.s2_nack, replay_backoff_ctr)
   }
   
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
@@ -1235,7 +1234,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_do_fence ||
     csr.io.csr_stall && !io.systolic_enable ||
     id_reg_pause ||
-    io.traceStall
+    io.traceStall ||
+    replay_backoff_active  // HartID backoff: stagger Decode re-entry after D$ nack
 
   // Full stall includes global stall feedback (freezes Decode when any core is behind)
   val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable)
@@ -1244,7 +1244,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 
   // Drive global stall backpressure from LOCAL conditions only (no loop)
-  io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb || replay_backoff_active)
+  io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb)
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -1377,7 +1377,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       io.dmem.replay_next || // long-latency load replaying
       (!long_latency_stall && (ibuf.io.inst(0).valid || io.imem.resp.valid)) // instruction pending
 
-    io.systolic_stall_out := replay_backoff_active || (dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
+    io.systolic_stall_out := (dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
       io.dmem.replay_next || // long-latency load replaying
       take_pc_wb || // pipeline flushes (eret, branch redirects)
       csr.io.interrupt       // async interrupts
