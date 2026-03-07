@@ -383,11 +383,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // Retry mode clears when the store commits at WB
   val simd_retry_override = simd_retry_inflight && io.systolic_enable
 
-  when (io.systolic_enable && (simd_dcache_backoff_active || simd_retry_inflight)) {
-    printf("C%d SIMD_BACKOFF t=%d backoff=%d inflight=%d nack=%d\n",
-      io.hartid, csr.io.time(31,0), simd_dcache_backoff, simd_retry_inflight, io.dmem.s2_nack)
-  }
-
   val take_pc_mem_wb = take_pc_wb || take_pc_mem
   // [Fix C] Mask take_pc for followers to prevent them from "following" leader's jumps/branches
   // and escaping their local spin-loops.
