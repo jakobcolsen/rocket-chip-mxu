@@ -941,7 +941,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   when (is_leader && global_replay_wb && !local_replay_req && io.systolic_enable) {
     systolic_rebroadcast := true.B
   }
-  when (!io.systolic_enable || (wb_valid && io.systolic_enable)) {
+  when (!io.systolic_enable || (wb_reg_valid && !replay_wb && !wb_xcpt && io.systolic_enable)) {
     systolic_rebroadcast := false.B
   }
 
