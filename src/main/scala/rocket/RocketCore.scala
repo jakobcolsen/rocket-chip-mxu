@@ -930,19 +930,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
-  // [Rebroadcast Flag] When the leader replays purely for re-broadcast (another
-  // core nacked but this core succeeded), suppress the leader's D-cache store
-  // request on the replay pass. The leader must still replay (to re-fetch and
-  // re-broadcast the instruction), but it must NOT re-issue its store — that
-  // would add contention and perpetuate the livelock.
-  // This makes the livelock self-resolving: each round, only nacked cores retry,
-  // at least one succeeds, and it drops out. O(N) rounds for N cores.
-  val systolic_rebroadcast = RegInit(false.B)
-  when (is_leader && global_replay_wb && !local_replay_req && io.systolic_enable) {
-    systolic_rebroadcast := true.B
+  // [Livelock Fix — Store-Done Tracking] When ANY core (leader or follower)
+  // successfully commits a SIMD memory write, record its PC and suppress future
+  // D-cache write requests for the same instruction. This prevents cores that
+  // already succeeded from contending with nacked cores during re-broadcast.
+  // Self-resolving: each replay round, at least one nacked core succeeds and
+  // drops out of contention. O(N) rounds for N cores.
+  val systolic_store_done = RegInit(false.B)
+  val systolic_done_pc    = Reg(UInt(vaddrBitsExtended.W))
+  
+  when (io.systolic_enable && wb_reg_valid && wb_ctrl.mem && !local_replay_req && !wb_xcpt) {
+    systolic_store_done := true.B
+    systolic_done_pc    := wb_reg_pc
   }
-  when (!io.systolic_enable || (wb_reg_valid && !replay_wb && !wb_xcpt && io.systolic_enable)) {
-    systolic_rebroadcast := false.B
+  when (!io.systolic_enable) {
+    systolic_store_done := false.B
   }
 
   // writeback arbitration
@@ -1330,11 +1332,12 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   }
 
 
-  // [Livelock Fix] Suppress leader's D-cache writes during re-broadcast to avoid
-  // re-creating cache line contention. Reads (loads) must still issue to avoid
-  // scoreboard deadlock (the register file expects a response).
-  val suppress_rebroadcast_store = systolic_rebroadcast && is_leader && !isRead(ex_ctrl.mem_cmd)
-  io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem && !suppress_rebroadcast_store
+  // [Livelock Fix] Suppress D-cache writes for any core that already committed
+  // the current SIMD store (matched by PC). Reads (loads) must still issue to
+  // avoid scoreboard deadlock. Only nacked cores (systolic_store_done=false) retry.
+  val suppress_done_store = systolic_store_done && io.systolic_enable &&
+    !isRead(ex_ctrl.mem_cmd) && ex_reg_pc === systolic_done_pc
+  io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem && !suppress_done_store
   val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
   require(coreParams.dcacheReqTagBits >= ex_dcache_tag.getWidth)
   io.dmem.req.bits.tag  := ex_dcache_tag
