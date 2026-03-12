@@ -930,6 +930,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
+  // [Rebroadcast Flag] When the leader replays purely for re-broadcast (another
+  // core nacked but this core succeeded), suppress the leader's D-cache store
+  // request on the replay pass. The leader must still replay (to re-fetch and
+  // re-broadcast the instruction), but it must NOT re-issue its store — that
+  // would add contention and perpetuate the livelock.
+  // This makes the livelock self-resolving: each round, only nacked cores retry,
+  // at least one succeeds, and it drops out. O(N) rounds for N cores.
+  val systolic_rebroadcast = RegInit(false.B)
+  when (is_leader && global_replay_wb && !local_replay_req && io.systolic_enable) {
+    systolic_rebroadcast := true.B
+  }
+  when (!io.systolic_enable || (wb_valid && io.systolic_enable)) {
+    systolic_rebroadcast := false.B
+  }
+
   // writeback arbitration
   val dmem_resp_xpu = !io.dmem.resp.bits.tag(0).asBool
   val dmem_resp_fpu =  io.dmem.resp.bits.tag(0).asBool
@@ -1315,7 +1330,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   }
 
 
-  io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem
+  // [Livelock Fix] Suppress leader's D-cache writes during re-broadcast to avoid
+  // re-creating cache line contention. Reads (loads) must still issue to avoid
+  // scoreboard deadlock (the register file expects a response).
+  val suppress_rebroadcast_store = systolic_rebroadcast && is_leader && !isRead(ex_ctrl.mem_cmd)
+  io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem && !suppress_rebroadcast_store
   val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
   require(coreParams.dcacheReqTagBits >= ex_dcache_tag.getWidth)
   io.dmem.req.bits.tag  := ex_dcache_tag
