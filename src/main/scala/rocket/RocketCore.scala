@@ -907,18 +907,25 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_wb_csr: Bool = wb_reg_valid && csr.io.rw_stall
   val replay_wb_vec = wb_reg_valid && io.vector.map(_.wb.replay).getOrElse(false.B)
   
-  // [Option B] Global replay OR-tree DISABLED — each core handles its own
-  // D-cache nacks locally. The stall OR-tree already prevents instruction drops.
-  // The global replay was causing Perfect Symmetry Livelock: all cores replayed
-  // simultaneously, re-colliding on the same cache line every cycle.
+  // [Global Replay] Separate local trigger from global result to avoid loops
+  // Multi-driver fix: local_replay_req is used by systolic_replay_out
   val local_replay_req = (replay_wb_common || replay_wb_rocc || replay_wb_csr || replay_wb_vec) && !wb_xcpt
-  io.systolic_replay_out := false.B  // Global replay disabled
+  io.systolic_replay_out := local_replay_req && io.systolic_enable
   
-  val replay_wb = local_replay_req
+  val global_replay_wb = io.systolic_replay_in && io.systolic_enable
   
-  when (io.systolic_enable && local_replay_req) {
-    printf("C%d SYSTOLIC LOCAL REPLAY pc=[%x] nack=%d csr_stall=%d\n",
-      io.hartid, wb_reg_pc, io.dmem.s2_nack, csr.io.rw_stall)
+  // [Livelock Fix] Only replay if:
+  //   (a) This core locally needs it (nack/hazard), OR
+  //   (b) This core is the Leader AND another core triggered global replay
+  //       (Leader must replay to re-broadcast the missed instruction)
+  // Successful followers do NOT replay — the stall OR-tree holds them until
+  // the nacked core finishes its local retry. This breaks Perfect Symmetry:
+  // only the nacked core(s) re-issue to D-cache, eliminating contention.
+  val replay_wb = local_replay_req || (global_replay_wb && is_leader)
+  
+  when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
+    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d leader=%d participating=%d nack=%d\n",
+      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, is_leader, replay_wb, io.dmem.s2_nack)
   }
   
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe

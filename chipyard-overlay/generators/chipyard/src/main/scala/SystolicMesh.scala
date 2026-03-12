@@ -94,12 +94,11 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
       // Decode stage so it holds the current instruction until all Followers
       // have digested it.
       val global_stall = sys_outputs.map(_.systolic_stall_out).reduce(_ || _)
-      // Global replay OR-tree DISABLED (Option B) — each core handles nacks locally.
-      // The stall OR-tree already prevents instruction drops.
+      val global_replay = sys_outputs.map(_.systolic_replay_out).reduce(_ || _)
 
       for (i <- 0 until count) {
         sys_inputs(i).systolic_stall := global_stall
-        sys_inputs(i).systolic_replay := false.B
+        sys_inputs(i).systolic_replay := global_replay
       }
 
     } else {
