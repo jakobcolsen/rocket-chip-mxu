@@ -416,7 +416,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.div := false.B
     id_ctrl.rocc := false.B
     id_ctrl.vec := false.B
-    id_ctrl.wxd := true.B // Keep writeback for ALU ops
+    // Note: wxd is NOT overridden — the decoder naturally produces wxd=true
+    // for register-writing instructions (ALU, CSR reads, lui, auipc, loads)
+    // and wxd=false for stores/fences. Forcing wxd=true on stores causes
+    // false hazards and register corruption (the S-type imm field overlaps rd).
   }
 
   val lgNXRegs = if (coreParams.useRVE) 4 else 5

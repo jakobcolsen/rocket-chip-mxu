@@ -291,7 +291,40 @@ io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem
 - **What it does:** Each core computes `ctrl_stalld_local` (all local hazards, cache misses, fences, etc.) and drives `systolic_stall_out` when it cannot accept the current instruction. The Mesh OR's these signals across all cores and feeds the result back into every core's `ctrl_stalld` via `io.systolic_stall`. This freezes the Leader's Decode stage so the instruction stays on the wire until all Followers have digested it.
 - **Why the split?** If `systolic_stall_out` depended on `ctrl_stalld` (which includes the global stall input), we would create a combinational loop: `ctrl_stalld → stall_out → mesh OR → stall_in → ctrl_stalld`. By computing `stall_out` from `ctrl_stalld_local` only, the loop is broken.
 
-### H. Broadcasting from the Leader
+### H. D-Cache Contention Livelock Fix (Store-Done Tracking)
+When all cores execute the same SIMD store targeting addresses within the **same 64-byte cache line**, TileLink can only grant exclusive access to one core per cycle. The others receive `s2_nack`, triggering the Global Replay OR-tree to force all cores to flush and re-issue — recreating the exact same collision. This is the **Perfect Symmetry** problem.
+
+Two mechanisms break the symmetry:
+
+**1. Selective Replay Gating:**
+```scala
+val replay_wb = local_replay_req || (global_replay_wb && is_leader)
+```
+- **Leader**: always replays on global replay (to re-fetch and re-broadcast the missed instruction).
+- **Nacked followers**: replay locally via `local_replay_req` (to retry D-cache).
+- **Successful followers**: skip replay entirely — the stall OR-tree holds them from advancing.
+
+**2. Store-Done D-Cache Suppression:**
+```scala
+val systolic_store_done = RegInit(false.B)
+val systolic_done_pc    = Reg(UInt(vaddrBitsExtended.W))
+
+when (io.systolic_enable && wb_reg_valid && wb_ctrl.mem && !local_replay_req && !wb_xcpt) {
+  systolic_store_done := true.B
+  systolic_done_pc    := wb_reg_pc
+}
+
+val suppress_done_store = systolic_store_done && io.systolic_enable &&
+  !isRead(ex_ctrl.mem_cmd) && ex_reg_pc === systolic_done_pc
+io.dmem.req.valid := ex_reg_valid && ex_ctrl.mem && !suppress_done_store
+```
+- **What it does:** When any core (leader or follower) successfully commits a SIMD store, it saves the PC and sets `systolic_store_done`. When the same instruction re-enters the EX stage (via re-broadcast), the D-cache write is suppressed. Only nacked cores (where the flag was never set) retry. PC matching ensures the flag auto-resets for different instructions.
+- **Convergence:** Self-resolving in O(N) rounds — each round, TileLink grants at least one nacked core. That core sets the flag and drops out of contention permanently.
+
+> [!IMPORTANT]
+> Loads (reads) are NOT suppressed — suppressing a load request would prevent the response from arriving, leaving the scoreboard set permanently and deadlocking the pipeline.
+
+### I. Broadcasting from the Leader
 ```scala
 io.systolic_instruction_out := id_inst(0)
 io.systolic_instruction_valid_out := is_leader && !ctrl_killd
@@ -310,6 +343,7 @@ io.systolic_pc_out := ibuf.io.pc
 6. As that instruction passes through Core 0's **Decode** stage, it is broadcast out onto the mesh via `systolic_instruction_out`.
 7. **Cores 1-3** receive the instruction through `id_effective_inst` and execute it precisely in lock-step. Each core reads its own `mhartid` and computes a unique store address, proving independent data with synchronized control.
 8. If **any core** encounters a D-cache miss or pipeline hazard, it asserts `systolic_stall_out`. The Mesh OR's all stall signals and broadcasts `global_stall` back to every core, freezing the Leader's Decode stage until the straggler catches up. No instructions are ever dropped.
+9. If multiple cores contend on the **same cache line**, the Store-Done Tracking mechanism (§8.I) prevents livelock: cores that already committed the store suppress their D-cache request on re-broadcast. Only nacked cores retry. The contention self-resolves in O(N) rounds.
 
 ---
 
@@ -359,5 +393,5 @@ firesim runworkload
 ```
 
 > [!TIP]
-> **Verified on 2026-03-04** with Verilator `VerilatorQuadRocketMXUConfig`. All 4 cores wrote `'A'+hartid` to `shared_results[hartid]`, producing `A`, `B`, `C`, `D` in lockstep — with **zero NOP gaps** and a **single store** per core, thanks to the global stall OR-tree.
+> **Verified on 2026-03-12** with Verilator `VerilatorQuadRocketMXUConfig`. All 4 cores wrote `'A'+hartid` to `shared_results[hartid]`, producing `A`, `B`, `C`, `D` in lockstep — with **zero NOP gaps**, a **single store** per core, and **no cache-line padding** required, thanks to the global stall OR-tree and Store-Done Tracking livelock fix.
 

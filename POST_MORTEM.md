@@ -62,8 +62,13 @@ The fix is a **combinational OR-tree stall network**:
 
 The previous RoCC-based barrier bitmap (`WithSystolicRoCC`) has been removed from the configuration.
 
-### v. D-Cache Contention Livelock — Software Padding (Implemented, Temporary)
-During lock-step execution, overlapping cache misses from multiple cores interacting with the same cache line led to infinite coherence livelocks. The leader and followers effectively deadlocked each other from acquiring write permissions. This was *temporarily* resolved by structurally padding shared memory arrays (e.g., SIMD result buffers) to ensure each core's target memory resides in an isolated 64-byte shifted block, completely neutralizing false-sharing and contention races. **This is a software workaround, not a hardware fix**; see §5.ii for the planned hardware solution.
+### v. D-Cache Contention Livelock — Store-Done Tracking (Implemented)
+During lock-step execution, overlapping cache misses from multiple cores interacting with the same cache line led to infinite coherence livelocks (the "Perfect Symmetry" problem — see §5.ii for full analysis). This was initially worked around with 64-byte software padding, then permanently resolved with a **two-part hardware fix**:
+
+1. **Selective Replay Gating**: `replay_wb = local_replay_req || (global_replay_wb && is_leader)` — only the Leader (for re-broadcast) and locally-nacked Followers participate in replays. Successful Followers skip the replay entirely; the stall OR-tree holds them.
+2. **Store-Done D-Cache Suppression**: A per-core `systolic_store_done` register + `systolic_done_pc` records when a SIMD store has been committed. When the same instruction re-enters the EX stage (via re-broadcast), writes are suppressed: `io.dmem.req.valid := ex_reg_valid && ex_ctrl.mem && !suppress_done_store`. Only nacked cores (where the flag was never set) retry their D-cache.
+
+This makes the livelock **self-resolving in O(N) rounds**: each round, TileLink grants at least one nacked core. That core sets `systolic_store_done` and drops out of contention. The Leader re-broadcasts on every round (D-cache suppressed), keeping the instruction on the mesh for remaining nacked Followers. Cache-line padding is no longer required.
 
 ### vi. Custom CSR Mesh Wiring and PTW Override Fix (Implemented)
 Custom CSRs `0x801` and `0x802` were originally masked to strictly 0 internally, preventing them from catching dynamic values from the mesh `sdata` pins. After setting their Chisel masks to `BigInt("FFFFFFFFFFFFFFFF", 16)`, a secondary issue was found where the `csr.io.customCSRs` bundle inputs were being overwritten by false defaults from a bidirectional `<>` connection to the Page Table Walker (PTW). The fix explicitly wires the PTW connection uni-directionally, preserving the dynamic mesh data inputs and enabling dynamic hardware-to-software data routing.
@@ -75,13 +80,13 @@ Custom CSRs `0x801` and `0x802` were originally masked to strictly 0 internally,
 
 ---
 
-## 5. Future Work
+## 5. Future Work / Abandoned Approaches
 
-### i. Decoupling Front-End from Execution (The "Ideal" Fix)
+### i. Decoupling Front-End from Execution (Abandoned)
 
-A fundamentally more robust (but more complex) solution would be to decouple the instruction fetch/decode stage from the execution stages using an instruction FIFO. This would allow the Leader to fetch ahead while the Followers (or the Leader itself) deal with asynchronous memory latencies. In this model, the "lockstep" would be enforced at the point of issue from the FIFO, rather than at the point of broadcast. This would eliminate the need for instantaneous global stall/replay trees and simplify timing closure for large-scale FPGA deployments (4x4 or 8x8 meshes), though it would require a significant overhaul of the Rocket pipeline's control logic.
+A fundamentally more robust (but more complex) solution would have been to decouple the instruction fetch/decode stage from the execution stages using an instruction FIFO. This was abandoned due to the significant overhaul required of the Rocket pipeline's control logic, and because the Store-Done Tracking fix (§4.v) resolved the livelock with minimal hardware changes.
 
-### ii. HartID-Based Replay Backoff — The "Perfect Symmetry" Fix (Planned)
+### ii. HartID-Based Replay Backoff (Superseded by §4.v)
 
 #### The Problem: Why Global Replay Enforces the Livelock
 The Global Replay Network (§4.iv) correctly fixes data corruption (no instruction is ever dropped), but it inadvertently **enforces** the D-cache livelock when cores contend on the same cache line:
@@ -92,46 +97,18 @@ The Global Replay Network (§4.iv) correctly fixes data corruption (no instructi
 
 This is the **Perfect Symmetry** problem: the very mechanism that keeps cores in lockstep also prevents the D-cache coherence protocol from ever making forward progress.
 
-#### Why Not Option A (Deterministic Winner + Stall Losers)?
-Option A would gate memory request issuance at the EX stage, selecting a single winner per cycle via round-robin. While theoretically elegant, it requires:
-*   New combinational paths through the Mesh at the EX stage (timing risk on FPGA).
-*   New signals in `SystolicInterface`, `SystolicMesh`, and `RocketCore` IO bundles.
-*   **The same N-cycle serial penalty** as sequential stalling — it just moves the serialization point earlier.
+#### Why Not Remove Global Replay (Option B)?
+An initial attempt removed the global replay OR-tree entirely, relying on the stall OR-tree alone. This **fundamentally failed** because the global replay serves a critical re-broadcast function: when a follower nacks at WB (3+ pipeline stages deep), the leader must replay to put the instruction back into its Decode stage for re-broadcast. The stall OR-tree can only freeze the *current* decode instruction — it cannot rewind to a past instruction.
 
-#### Option B: Replay Backoff (Recommended — Minimal Change, High Performance)
-Keep the flat instruction broadcast. Introduce a deterministic, `hartid`-based delay **only** during the Global Replay phase. The cost is paid only when a collision actually occurs; all compute instructions remain at full 1.0 IPC.
+#### Why Not HartID-Based Backoff?
+A `hartid * K` cycle backoff was proposed to stagger replays. This conflicts with the stall OR-tree: every time a replaying core causes `take_pc_mem_wb`, the stall network re-synchronizes all cores, effectively canceling the backoff. The two mechanisms fight each other.
 
-**Where** (in `RocketCore.scala`, around lines 910–916):
-```scala
-// Current code:
-val replay_wb = local_replay_req || global_replay_wb
+#### Implemented Solution: Store-Done Tracking (§4.v)
+The actual fix uses two mechanisms:
+1. **Selective replay gating** — successful followers skip replay entirely
+2. **Per-core store-done flag** — cores that already committed the store suppress their D-cache request on re-broadcast
 
-// Proposed replacement:
-val replay_delay_ctr = RegInit(0.U(8.W))
-val replay_backoff_active = replay_delay_ctr > 0.U
-
-// When a *remote* replay arrives and this core didn't locally nack,
-// load a hartid-proportional delay before allowing the replay to fire.
-when (global_replay_wb && !local_replay_req && !replay_backoff_active) {
-  replay_delay_ctr := io.hartid * K.U   // K ≈ 8 cycles
-}
-when (replay_backoff_active) {
-  replay_delay_ctr := replay_delay_ctr - 1.U
-}
-
-// The actual replay fires immediately for the local nack originator,
-// and on a delayed schedule for everyone else.
-val replay_wb = local_replay_req || (global_replay_wb && !replay_backoff_active)
-```
-
-**Why this works**:
-*   The core that triggered the nack (`local_replay_req`) replays immediately.
-*   All other cores stall at the WB stage for `hartid * K` cycles. The nack'd instruction is held in WB via `wb_reg_replay` — no PC rewrite, no architectural divergence.
-*   When the backoff counter expires, the core replays. By that time, the earlier cores have already completed their retries and released the cache line.
-*   **Deterministic, not random**: `hartid * K` is reproducible on FPGA.
-*   **Zero cost for compute**: The backoff counter only activates on actual D-cache collisions.
-
-**Verification**: Remove the 64-byte padding from `hello_systolic_flow.c` and `hello_simd.c`. The simulation must complete without hanging.
+This breaks Perfect Symmetry without removing the essential re-broadcast mechanism. Self-resolving in O(N) rounds. **Verified on 2026-03-12** with both padded and unpadded tests.
 
 ## 6. Conclusion
-The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. Memory contention has been structurally isolated via cache-line padding (temporary) with a hardware Replay Backoff solution planned. Custom CSRs dynamically expose real-time mesh data to the executable cores. The SIMD payload now streams seamlessly with zero NOP gaps — fully verified on 2026-03-05 with Verilator.
+The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. The D-cache contention livelock has been fully resolved via **Store-Done Tracking** (selective replay gating + per-core D-cache suppression), eliminating the need for software cache-line padding. Custom CSRs dynamically expose real-time mesh data to the executable cores. The SIMD payload now streams seamlessly with zero NOP gaps and no memory layout constraints — fully verified on 2026-03-12 with Verilator.
