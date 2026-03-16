@@ -1251,7 +1251,26 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 
   // Drive global stall backpressure from LOCAL conditions only (no loop)
-  io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem_wb)
+  //
+  // [Deadlock Fix] Followers must ONLY assert stall_out when their pipeline is
+  // actively processing an instruction.  After a replay or pipeline flush, the
+  // follower's EX/MEM/WB valid bits go false (pipeline drains).  If stalld_local
+  // remains high due to residual conditions (csr_stall from WFI, dcache_blocked,
+  // hazards from stale pipeline state), a drained follower would deadlock the
+  // array: the Leader can't send the next instruction because global_stall is
+  // high, and the follower can't clear its stall without the next instruction.
+  //
+  // By gating follower stall_out on pipeline activity, drained followers release
+  // backpressure, letting the Leader advance and re-feed them.
+  //
+  // Leader stall_out: stalld_local OR take_pc_mem_wb (flush/replay in progress).
+  // Follower stall_out: stalld_local AND pipeline_active (genuinely behind).
+  val follower_pipeline_active = ex_reg_valid || mem_reg_valid || wb_reg_valid
+  io.systolic_stall_out := io.systolic_enable && Mux(is_leader,
+    ctrl_stalld_local || take_pc_mem_wb,
+    ctrl_stalld_local && follower_pipeline_active
+  )
+
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
@@ -1360,6 +1379,26 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   io.dmem.s1_data.data := (if (fLen == 0) mem_reg_rs2 else Mux(mem_ctrl.fp, Fill(coreDataBits / fLen, io.fpu.store_data), mem_reg_rs2))
   io.dmem.s1_data.mask := DontCare
+
+  // === SIMD STORE DEBUG (remove after debugging) ===
+  // EX stage: print store address and suppression info when a SIMD mem op is in EX
+  when (io.systolic_enable && ex_reg_valid && ex_ctrl.mem) {
+    printf("STORE_EX C%d pc=%x addr=%x rs1=%x alu_out=%x cmd=%d suppress=%d done=%d done_pc=%x\n",
+      io.hartid, ex_reg_pc, io.dmem.req.bits.addr,
+      ex_rs(0), alu.io.adder_out, ex_ctrl.mem_cmd,
+      suppress_done_store, systolic_store_done, systolic_done_pc)
+  }
+  // MEM stage: print store data
+  when (io.systolic_enable && mem_reg_valid && mem_ctrl.mem && !isRead(mem_ctrl.mem_cmd)) {
+    printf("STORE_MEM C%d pc=%x data=%x rs2=%x\n",
+      io.hartid, mem_reg_pc, mem_reg_rs2, mem_reg_rs2)
+  }
+  // WB stage: print CSR read results (when CSR op commits)
+  when (io.systolic_enable && wb_valid && wb_ctrl.csr =/= CSR.N) {
+    printf("CSR_WB C%d pc=%x addr=%x rdata=%x waddr=%d\n",
+      io.hartid, wb_reg_pc, wb_reg_inst(31,20), csr.io.rw.rdata, wb_waddr)
+  }
+
 
   io.dmem.s1_kill := killm_common || mem_ldst_xcpt || fpu_kill_mem || vec_kill_mem
   io.dmem.s2_kill := false.B
