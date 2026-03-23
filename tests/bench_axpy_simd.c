@@ -37,6 +37,7 @@ volatile int32_t X[N]  __attribute__((aligned(64)));
 volatile int32_t Y[N]  __attribute__((aligned(64)));
 
 volatile int core_ready[16] = {0};
+volatile int init_done = 0;  /* leader signals after array init */
 
 void thread_entry(int cid, int nc) {
     /* no-op */
@@ -91,6 +92,10 @@ int main(void) {
             X[i] = i + 1;
             Y[i] = 100 + i;
         }
+        asm volatile ("fence rw, rw" ::: "memory");
+
+        /* Signal followers that arrays are ready for cache pre-warm */
+        init_done = 1;
         asm volatile ("fence rw, rw" ::: "memory");
 
         /* ── START TIMING ──────────────────────────────────────── */
@@ -177,6 +182,23 @@ int main(void) {
 
     } else {
         /* ── FOLLOWER ────────────────────────────────────────── */
+
+        /* Wait for leader to finish initializing arrays */
+        while (init_done == 0) { asm volatile ("nop"); }
+        asm volatile ("fence rw, rw" ::: "memory");
+
+        /* Pre-warm D-cache: touch our X and Y slices so the first
+         * SIMD store doesn't cold-miss and nack. */
+        {
+            volatile int32_t dummy;
+            int base = hartid * SLICE;
+            for (int i = 0; i < SLICE; i++) {
+                dummy = X[base + i];
+                dummy = Y[base + i];
+            }
+        }
+        asm volatile ("fence rw, rw" ::: "memory");
+
         /* Sleep until hardware SIMD wakeup, then park forever */
         while (1) {
             asm volatile ("wfi");
