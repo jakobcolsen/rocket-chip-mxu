@@ -78,6 +78,65 @@ Custom CSRs `0x801` and `0x802` were originally masked to strictly 0 internally,
 *   **64+ cores**: A registered hierarchical stall tree (grouping cores into sub-arrays) would be needed to meet timing at high clock frequencies. This adds ~1 cycle latency per tree level.
 *   **Performance**: The stall only fires on actual D-cache misses. For compute-heavy SIMD kernels (ALU-bound), it is essentially free. Compared to the old 16-NOP gaps per instruction, throughput is significantly improved.
 
+### viii. Store-Nack Stall-Out Race — `dcache_blocked` Fix (Implemented)
+
+Discovered during AXPY benchmark testing (2026-03-22). The first SIMD store on each follower was **silently dropped** — followers' array slices showed element 0 untouched while elements 1–15 were correct.
+
+#### Root Cause
+The follower `stall_out` signal was gated by `follower_pipeline_active` (§4.iv comment) to prevent WFI-related deadlock. After a store nack at WB:
+1. `take_pc_wb` fires → pipeline kills in-flight instructions → all valid bits drop
+2. `follower_pipeline_active = ex_reg_valid || mem_reg_valid || wb_reg_valid = false`
+3. `stall_out = ctrl_stalld_local && false = false` — **backpressure dropped prematurely**
+4. But `dcache_blocked` remains high while TileLink processes the Shared→Modified upgrade
+5. Leader sees no backpressure, advances to the next instruction
+6. Follower can't accept the re-broadcast (decode stalls on `id_ctrl.mem && dcache_blocked`)
+7. Leader broadcasts the *next* instruction — **nacked store permanently lost**
+
+The first store is most vulnerable because followers have cold D-caches (leader initialized the arrays). The Shared→Modified cache line upgrade nacks while TileLink probes the leader's L1.
+
+#### Diagnostic Confirmation
+Swapping the execution order of AXPY_ONE(0) and AXPY_ONE(4) moved the failure from element 0 to element 1 — proving it tracks the **first-executed store**, not a specific address.
+
+#### Fix
+Add `dcache_blocked` as an independent stall source that bypasses the `follower_pipeline_active` gate:
+```scala
+io.systolic_stall_out := io.systolic_enable && Mux(is_leader,
+  ctrl_stalld_local || take_pc_mem_wb,
+  (ctrl_stalld_local && follower_pipeline_active) || dcache_blocked
+)
+```
+`dcache_blocked` is self-resolving (clears on TileLink grant, typically 3–10 cycles) and is never set by WFI, so the original deadlock scenario is unaffected. **Verified on 2026-03-22** — AXPY benchmark passes all 64 elements, `hello_simd_nopad` regression passes.
+
+### ix. PipelinedMultiplier Desync in SIMD Mode (Open — SW Workaround)
+
+Discovered during the same AXPY benchmark session. The RISC-V `mul` instruction produces **incorrect results on follower cores** during SIMD lockstep, while the leader's results are correct.
+
+#### Root Cause
+Rocket's `PipelinedMultiplier` (`Multiplier.scala:186`) uses Chisel `Pipe` primitives with `latency=2`:
+```scala
+val in = Pipe(io.req)                        // stage 1
+io.resp.bits.data := Pipe(in.valid, muxed, latency-1).bits  // stage 2
+```
+`Pipe` is a blind shift register — **it has no stall or enable input**. When the global stall OR-tree freezes the main pipeline (e.g., during a follower D-cache miss), the multiplier's internal pipeline **keeps advancing**. The result arrives at `mul.io.resp` on a cycle when the mul instruction has NOT yet reached WB. By the time the instruction reaches WB, the multiplier output is stale.
+
+The **leader** is unaffected because its D-cache is warm (it just initialized the arrays) — no cache misses, no pipeline stalls, the multiplier stays synchronized.
+
+#### SW Workaround
+Compute `a*X` via `slli` + `add` (e.g., `3*X = (X<<1) + X`). These are single-cycle ALU operations that stay in the main pipeline and cannot desync.
+
+#### Future HW Fix
+Add a stall/enable input to `PipelinedMultiplier` gated by `ctrl_stalld`, so the internal `Pipe` registers freeze when the main pipeline stalls:
+```scala
+class PipelinedMultiplier(width: Int, latency: Int, ...) extends Module {
+  val io = IO(new Bundle {
+    val req = Flipped(Valid(...))
+    val resp = Valid(...)
+    val stall = Input(Bool())  // NEW
+  })
+  // Replace Pipe() with stall-gated ShiftRegister
+}
+```
+
 ---
 
 ## 5. Future Work / Abandoned Approaches
@@ -111,4 +170,8 @@ The actual fix uses two mechanisms:
 This breaks Perfect Symmetry without removing the essential re-broadcast mechanism. Self-resolving in O(N) rounds. **Verified on 2026-03-12** with both padded and unpadded tests.
 
 ## 6. Conclusion
-The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. The D-cache contention livelock has been fully resolved via **Store-Done Tracking** (selective replay gating + per-core D-cache suppression), eliminating the need for software cache-line padding. Custom CSRs dynamically expose real-time mesh data to the executable cores. The SIMD payload now streams seamlessly with zero NOP gaps and no memory layout constraints — fully verified on 2026-03-12 with Verilator.
+The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. The D-cache contention livelock has been fully resolved via **Store-Done Tracking** (selective replay gating + per-core D-cache suppression), eliminating the need for software cache-line padding. The **store-nack stall_out race** (§4.viii) has been fixed by adding `dcache_blocked` to the follower stall backpressure, ensuring store instructions are never silently dropped during cache line upgrades. Custom CSRs dynamically expose real-time mesh data to the executable cores.
+
+An AXPY benchmark (N=64, 4 cores, 16 elements/core) demonstrates **419 cycles SIMD vs 502 cycles MIMD** (~17% speedup) over a manual fork-join implementation. The `PipelinedMultiplier` desync (§4.ix) remains an open issue with a software workaround (`slli+add` instead of `mul`).
+
+Fully verified on 2026-03-22 with Verilator (`VerilatorQuadRocketMXUConfig`).
