@@ -1263,12 +1263,19 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // By gating follower stall_out on pipeline activity, drained followers release
   // backpressure, letting the Leader advance and re-feed them.
   //
+  // [Store-Nack Fix] EXCEPTION: dcache_blocked must bypass the pipeline_active
+  // gate.  After a store nack, the pipeline drains (follower_pipeline_active=false)
+  // but dcache_blocked stays high while TileLink processes the Shared→Modified
+  // upgrade.  Without this term, the leader races ahead and the nacked store is
+  // permanently lost.  dcache_blocked is self-resolving (clears on TileLink grant,
+  // typically 3-10 cycles), so it cannot deadlock — unlike csr_stall from WFI.
+  //
   // Leader stall_out: stalld_local OR take_pc_mem_wb (flush/replay in progress).
-  // Follower stall_out: stalld_local AND pipeline_active (genuinely behind).
+  // Follower stall_out: (stalld_local AND pipeline_active) OR dcache_blocked.
   val follower_pipeline_active = ex_reg_valid || mem_reg_valid || wb_reg_valid
   io.systolic_stall_out := io.systolic_enable && Mux(is_leader,
     ctrl_stalld_local || take_pc_mem_wb,
-    ctrl_stalld_local && follower_pipeline_active
+    (ctrl_stalld_local && follower_pipeline_active) || dcache_blocked
   )
 
 
