@@ -125,9 +125,9 @@ int main(void) {
             "la   t1, Y               \n\t"
             "add  t1, t1, t5           \n\t"
 
-            /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
-            AXPY_ONE(0)
+            /* Unrolled AXPY: DIAGNOSTIC — offset 4 first, then 0 */
             AXPY_ONE(4)
+            AXPY_ONE(0)
             AXPY_ONE(8)
             AXPY_ONE(12)
             AXPY_ONE(16)
