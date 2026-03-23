@@ -46,22 +46,15 @@ void thread_entry(int cid, int nc) {
  * Fully-unrolled AXPY for one element at word offset `off` from base.
  *   t0 = base pointer into X (for this core's slice)
  *   t1 = base pointer into Y (for this core's slice)
+ *   t2 = scalar a
  *   t3, t4 = temporaries
  *
- * NOTE: We avoid the RISC-V `mul` instruction because Rocket's
- * PipelinedMultiplier has a 2-stage latency with late writeback.
- * During SIMD lockstep, the multiplier result appears to be lost
- * on follower cores (the global stall/replay network doesn't
- * correctly synchronize the pipelined multiplier response path).
- * Instead, we compute 3*X as (X<<1)+X using single-cycle ALU ops.
- *
- * Each element: lw t3, off(t0);  slli t4, t3, 1;  add t3, t4, t3;
- *               lw t4, off(t1);  add t3, t3, t4;  sw t3, off(t1)
+ * Each element: lw t3, off(t0); mul t3, t3, t2; lw t4, off(t1);
+ *               add t3, t3, t4; sw t3, off(t1)
  */
 #define AXPY_ONE(byte_off) \
     "lw   t3, " #byte_off "(t0) \n\t" \
-    "slli t4, t3, 1             \n\t" \
-    "add  t3, t4, t3            \n\t" \
+    "mul  t3, t3, t2            \n\t" \
     "lw   t4, " #byte_off "(t1) \n\t" \
     "add  t3, t3, t4            \n\t" \
     "sw   t3, " #byte_off "(t1) \n\t"
@@ -124,6 +117,7 @@ int main(void) {
             "add  t0, t0, t5           \n\t"
             "la   t1, Y               \n\t"
             "add  t1, t1, t5           \n\t"
+            "li   t2, %[scalar]        \n\t"  /* t2 = a                 */
 
 
             /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
@@ -146,7 +140,7 @@ int main(void) {
 
             "fence rw, rw              \n\t"
             :
-            :
+            : [scalar] "i" (SCALAR_A)
             : "t0", "t1", "t2", "t3", "t4", "t5", "memory"
         );
 
