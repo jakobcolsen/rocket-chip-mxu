@@ -136,7 +136,8 @@ int main(void) {
              * The dummy load on X brings it into L1 via the safe scoreboard
              * path (loads don't trigger the race). */
             "lw   t3, 0(t0)            \n\t"  /* warm X cache line (load) */
-            "sw   zero, 0(t1)          \n\t"  /* sacrificial store to Y   */
+            "lw   t4, 0(t1)            \n\t"  /* load Y[base+0] value     */
+            "sw   t4, 0(t1)            \n\t"  /* store same value back    */
 
             /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
             AXPY_ONE(0)
