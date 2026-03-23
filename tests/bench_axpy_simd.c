@@ -37,7 +37,6 @@ volatile int32_t X[N]  __attribute__((aligned(64)));
 volatile int32_t Y[N]  __attribute__((aligned(64)));
 
 volatile int core_ready[16] = {0};
-volatile int init_done = 0;  /* leader signals after array init */
 
 void thread_entry(int cid, int nc) {
     /* no-op */
@@ -47,7 +46,7 @@ void thread_entry(int cid, int nc) {
  * Fully-unrolled AXPY for one element at word offset `off` from base.
  *   t0 = base pointer into X (for this core's slice)
  *   t1 = base pointer into Y (for this core's slice)
- *   t3, t4, t5 = temporaries
+ *   t3, t4 = temporaries
  *
  * NOTE: We avoid the RISC-V `mul` instruction because Rocket's
  * PipelinedMultiplier has a 2-stage latency with late writeback.
@@ -94,35 +93,37 @@ int main(void) {
         }
         asm volatile ("fence rw, rw" ::: "memory");
 
-        /* Signal followers that arrays are ready for cache pre-warm */
-        init_done = 1;
-        asm volatile ("fence rw, rw" ::: "memory");
-
         /* ── START TIMING ──────────────────────────────────────── */
         uint64_t cyc_start = read_csr(mcycle);
-
-        /* Activate SIMD — hardware wakes followers from WFI */
-        asm volatile ("csrw 0x800, %0" :: "r"(2));
 
         /*
          * Broadcast AXPY kernel — all 4 cores execute this in lockstep.
          *
+         * SIMD enable (csrw 0x800, 2) is INSIDE this asm block to
+         * guarantee zero compiler-inserted instructions between the
+         * enable and the first kernel instruction. The CSR flush
+         * hardware kills the pipeline shadow after the csrw, so
+         * the first real instruction (csrr t5) enters a clean pipe.
+         *
          * Register plan (same instruction stream, different data per core):
-         *   t0 = &X[hartid * SLICE]     (each core computes its own offset)
+         *   t0 = &X[hartid * SLICE]
          *   t1 = &Y[hartid * SLICE]
          *   t3, t4 = temporaries for AXPY computation
-         *
-         * Since SLICE=16 and sizeof(int32_t)=4, the byte offset for the
-         * slice is hartid * 64.  We compute hartid * 64 = hartid << 6.
+         *   t5 = hartid (from csrr), then hartid * 64 (from slli)
+         *   t2 = SIMD enable constant (2), reused freely after csrw
          */
         asm volatile (
+            /* Activate SIMD mode */
+            "li   t2, 2                \n\t"
+            "csrw 0x800, t2            \n\t"
+
             /* Compute slice base addresses */
-            "csrr t5, mhartid          \n\t"  /* t5 = hartid              */
-            "slli t5, t5, 6            \n\t"  /* t5 = hartid * 64 (bytes) */
+            "csrr t5, mhartid          \n\t"
+            "slli t5, t5, 6            \n\t"  /* t5 = hartid * 64 bytes */
             "la   t0, X               \n\t"
-            "add  t0, t0, t5           \n\t"  /* t0 = &X[slice_start]     */
+            "add  t0, t0, t5           \n\t"
             "la   t1, Y               \n\t"
-            "add  t1, t1, t5           \n\t"  /* t1 = &Y[slice_start]     */
+            "add  t1, t1, t5           \n\t"
 
             /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
             AXPY_ONE(0)
@@ -145,7 +146,7 @@ int main(void) {
             "fence rw, rw              \n\t"
             :
             :
-            : "t0", "t1", "t3", "t4", "t5", "memory"
+            : "t0", "t1", "t2", "t3", "t4", "t5", "memory"
         );
 
         /* Deactivate SIMD */
@@ -182,23 +183,6 @@ int main(void) {
 
     } else {
         /* ── FOLLOWER ────────────────────────────────────────── */
-
-        /* Wait for leader to finish initializing arrays */
-        while (init_done == 0) { asm volatile ("nop"); }
-        asm volatile ("fence rw, rw" ::: "memory");
-
-        /* Pre-warm D-cache: touch our X and Y slices so the first
-         * SIMD store doesn't cold-miss and nack. */
-        {
-            volatile int32_t dummy;
-            int base = hartid * SLICE;
-            for (int i = 0; i < SLICE; i++) {
-                dummy = X[base + i];
-                dummy = Y[base + i];
-            }
-        }
-        asm volatile ("fence rw, rw" ::: "memory");
-
         /* Sleep until hardware SIMD wakeup, then park forever */
         while (1) {
             asm volatile ("wfi");
