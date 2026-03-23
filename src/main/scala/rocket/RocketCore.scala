@@ -413,7 +413,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.amo := false.B
     id_ctrl.fp := false.B
     // id_ctrl.mul := false.B  // Allow MUL for systolic MAC
-    id_ctrl.div := false.B
+    // id_ctrl.div := false.B  // REMOVED: div covers BOTH mul AND div in Rocket decode — was killing MUL on followers
     id_ctrl.rocc := false.B
     id_ctrl.vec := false.B
     // Note: wxd is NOT overridden — the decoder naturally produces wxd=true
@@ -1272,10 +1272,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   //
   // Leader stall_out: stalld_local OR take_pc_mem_wb (flush/replay in progress).
   // Follower stall_out: (stalld_local AND pipeline_active) OR dcache_blocked.
+  // [Livelock Fix] dcache_blocked must NOT stall the array when the follower
+  // already committed its store (systolic_store_done). During Store-Done replay,
+  // TileLink Probes from nacked cores cause dcache_blocked on successful cores.
+  // Without this gate, the Probe re-synchronizes all cores via the stall OR-tree,
+  // preventing nacked cores from retrying independently (Perfect Symmetry).
   val follower_pipeline_active = ex_reg_valid || mem_reg_valid || wb_reg_valid
   io.systolic_stall_out := io.systolic_enable && Mux(is_leader,
     ctrl_stalld_local || take_pc_mem_wb,
-    (ctrl_stalld_local && follower_pipeline_active) || dcache_blocked
+    (ctrl_stalld_local && follower_pipeline_active) || (dcache_blocked && !systolic_store_done)
   )
 
 

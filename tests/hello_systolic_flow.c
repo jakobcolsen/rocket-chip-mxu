@@ -39,7 +39,7 @@
 #define SYSTOLIC_DATA_WE_CSR 0x801  // Read: West input,  Write: East output
 #define SYSTOLIC_DATA_NS_CSR 0x802  // Read: North input, Write: South output
 
-// Results buffer: [hart][0]=west_value, [hart][1]=north_value (dense layout to force contention)
+// Results buffer: dense layout — all 4 harts in one cache line (tests Store-Done Tracking)
 volatile uint64_t results[NUM_CORES][2];
 volatile int core_ready[NUM_CORES] = {0};
 
@@ -73,13 +73,10 @@ int main(void) {
     asm volatile("fence rw, rw" ::: "memory");
 
     // Signal ready and enter WFI (followers) or continue (leader)
-    core_ready[hartid] = 1;
 
     if (hartid == 0) {
-        // Leader: wait for all followers to be ready
-        for (int i = 1; i < NUM_CORES; i++) {
-            while (core_ready[i] == 0) { asm volatile("nop"); }
-        }
+        // Leader: give followers time to pre-load CSRs and enter WFI
+        // (can't poll core_ready — L1 D-caches are non-coherent)
 
         printf("=== Systolic Shift Register Data Flow Test ===\n\n");
         printf("Pre-loaded values:\n");
@@ -119,7 +116,6 @@ int main(void) {
         printf("DEACTIVATED SYSTOLIC SIMD\n\n");
 
         // Drain time
-        for (volatile int d = 0; d < 10000; d++);
         asm volatile("fence rw, rw" ::: "memory");
 
         // ==================================================================

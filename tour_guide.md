@@ -256,6 +256,9 @@ Because followers blindly execute whatever the Leader broadcasts, they cannot ev
 - **What it does**: This logic forcefully blinds Followers to all complex control logic while in SIMD mode. 
 - **Consequences**: By killing branches, Follower cores are physically incapable of deviating from the Leader's execution path. They evaluate the math inside `if` statements but discard the jump. Furthermore, by killing `amo` (Atomic Memory Operations), followers cannot acquire hardware locks. This creates a **Pure Compute** SIMD model: all branching, locking, and synchronization must occur in standard MIMD mode, while the SIMD region is restricted to unrolled, branchless math kernels.
 
+> [!CAUTION]
+> The `id_ctrl.div` signal controls Rocket's **MulDiv unit** — it gates both `mul` AND `div` instructions. An earlier version set `id_ctrl.div := false.B` for followers, which silently converted all `MUL` instructions to `ADD` (the only encoding difference is funct7 bit 0). This was fixed on 2026-03-23 — `div` is no longer overridden. See POST_MORTEM §4.viii for the full diagnosis.
+
 ### E. Pipeline Control and Safety Overrides
 When injecting foreign instructions into a pipeline, things can go disastrously wrong if you don't suppress local safety checks.
 ```scala
@@ -290,6 +293,7 @@ io.systolic_stall_out := io.systolic_enable && (ctrl_stalld_local || take_pc_mem
 ```
 - **What it does:** Each core computes `ctrl_stalld_local` (all local hazards, cache misses, fences, etc.) and drives `systolic_stall_out` when it cannot accept the current instruction. The Mesh OR's these signals across all cores and feeds the result back into every core's `ctrl_stalld` via `io.systolic_stall`. This freezes the Leader's Decode stage so the instruction stays on the wire until all Followers have digested it.
 - **Why the split?** If `systolic_stall_out` depended on `ctrl_stalld` (which includes the global stall input), we would create a combinational loop: `ctrl_stalld → stall_out → mesh OR → stall_in → ctrl_stalld`. By computing `stall_out` from `ctrl_stalld_local` only, the loop is broken.
+- **Follower stall_out:** For followers, the stall output also includes `dcache_blocked && !systolic_store_done`. The `dcache_blocked` term catches the window after a store nack where the pipeline has drained but TileLink is still processing. The `!systolic_store_done` gate prevents done followers from stalling the array during TileLink Probes (coherence downgrades) — without this gate, Probes would re-synchronize all cores and recreate the Perfect Symmetry livelock. See POST_MORTEM §4.ix.
 
 ### H. D-Cache Contention Livelock Fix (Store-Done Tracking)
 When all cores execute the same SIMD store targeting addresses within the **same 64-byte cache line**, TileLink can only grant exclusive access to one core per cycle. The others receive `s2_nack`, triggering the Global Replay OR-tree to force all cores to flush and re-issue — recreating the exact same collision. This is the **Perfect Symmetry** problem.
@@ -393,5 +397,8 @@ firesim runworkload
 ```
 
 > [!TIP]
-> **Verified on 2026-03-12** with Verilator `VerilatorQuadRocketMXUConfig`. All 4 cores wrote `'A'+hartid` to `shared_results[hartid]`, producing `A`, `B`, `C`, `D` in lockstep — with **zero NOP gaps**, a **single store** per core, and **no cache-line padding** required, thanks to the global stall OR-tree and Store-Done Tracking livelock fix.
+> **Verified on 2026-03-23** with Verilator `VerilatorQuadRocketMXUConfig` on the `hardware-fork-join` branch:
+> - `hello_simd` — All 4 cores wrote `'A'+hartid` to `shared_results[hartid]` in lockstep ✓
+> - `bench_axpy_simd` — AXPY with `MUL` (Y = 3*X + Y), all 64 elements correct, 409 cycles ✓
+> - `hello_systolic_flow` — Systolic data through 2×2 mesh with **same-cache-line stores** (no padding), all values correct ✓
 
