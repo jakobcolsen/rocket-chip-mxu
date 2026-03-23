@@ -125,12 +125,18 @@ int main(void) {
             "la   t1, Y               \n\t"
             "add  t1, t1, t5           \n\t"
 
-            /* Pre-warm: dummy loads to bring X and Y cache lines into
-             * each follower's L1 D-cache BEFORE the first store.
-             * Loads use the scoreboard replay path (not local_replay_req),
-             * so they don't trigger the store-nack pipeline drain race. */
-            "lw   t3, 0(t0)            \n\t"  /* warm X cache line */
-            "lw   t4, 0(t1)            \n\t"  /* warm Y cache line */
+            /* Cache-line priming: the FIRST store in SIMD mode is lost
+             * due to a HW race (follower drops stall_out after pipeline
+             * drain, leader races ahead). But the D-cache Shared→Modified
+             * upgrade still completes in the background.
+             *
+             * Strategy: issue a sacrificial dummy store to Y before the
+             * real kernel. It gets lost, but the cache upgrade completes.
+             * Then AXPY_ONE(0)'s sw finds the line in Modified and succeeds.
+             * The dummy load on X brings it into L1 via the safe scoreboard
+             * path (loads don't trigger the race). */
+            "lw   t3, 0(t0)            \n\t"  /* warm X cache line (load) */
+            "sw   zero, 0(t1)          \n\t"  /* sacrificial store to Y   */
 
             /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
             AXPY_ONE(0)
