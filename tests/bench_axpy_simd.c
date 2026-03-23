@@ -125,9 +125,16 @@ int main(void) {
             "la   t1, Y               \n\t"
             "add  t1, t1, t5           \n\t"
 
-            /* Unrolled AXPY: DIAGNOSTIC — offset 4 first, then 0 */
-            AXPY_ONE(4)
+            /* Pre-warm: dummy loads to bring X and Y cache lines into
+             * each follower's L1 D-cache BEFORE the first store.
+             * Loads use the scoreboard replay path (not local_replay_req),
+             * so they don't trigger the store-nack pipeline drain race. */
+            "lw   t3, 0(t0)            \n\t"  /* warm X cache line */
+            "lw   t4, 0(t1)            \n\t"  /* warm Y cache line */
+
+            /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
             AXPY_ONE(0)
+            AXPY_ONE(4)
             AXPY_ONE(8)
             AXPY_ONE(12)
             AXPY_ONE(16)
