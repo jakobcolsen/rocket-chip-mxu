@@ -39,8 +39,9 @@
 #define SYSTOLIC_DATA_WE_CSR 0x801  // Read: West input,  Write: East output
 #define SYSTOLIC_DATA_NS_CSR 0x802  // Read: North input, Write: South output
 
-// Results buffer: dense layout — all 4 harts in one cache line (tests Store-Done Tracking)
-volatile uint64_t results[NUM_CORES][2];
+// Results buffer: each core gets its own 64-byte cache line to avoid contention
+// Layout: results[core][0] = west, results[core][1] = north, [2..7] = padding
+volatile uint64_t results[NUM_CORES][8] __attribute__((aligned(64)));
 volatile int core_ready[NUM_CORES] = {0};
 
 void thread_entry(int cid, int nc) {
@@ -102,7 +103,7 @@ int main(void) {
             "csrr  t0, 0x801          \n\t"  // t0 = West input register
             "csrr  t1, 0x802          \n\t"  // t1 = North input register
             "csrr  t2, mhartid        \n\t"  // t2 = hart id
-            "slli  t3, t2, 4          \n\t"  // t3 = hartid * 16 (2 x uint64_t)
+            "slli  t3, t2, 6          \n\t"  // t3 = hartid * 64 (cache-line stride)
             "la    t4, results        \n\t"
             "add   t4, t4, t3         \n\t"  // t4 = &results[hartid]
             "sd    t0, 0(t4)          \n\t"  // results[hartid][0] = west
