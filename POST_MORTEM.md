@@ -87,8 +87,8 @@ The constrained SIMD masking (§2.A / tour_guide §8.D) forcefully disables dang
 
 **Fix**: Commented out `id_ctrl.div := false.B`. The line already had a comment `// Allow MUL for systolic MAC` indicating the original intent.
 
-### ix. dcache_blocked Stall Interaction with Store-Done Tracking (Fixed 2026-03-23)
-The `dcache_blocked` term in follower `stall_out` (added in commit `39c45b8e1` to prevent store loss during TileLink upgrades) created a new livelock path when combined with Store-Done Tracking (§4.v):
+### ix. dcache_blocked and Cache-Line Contention (Resolved via Software Padding — 2026-03-24)
+The `dcache_blocked` term in follower `stall_out` (added in commit `39c45b8e1` to prevent store loss during TileLink upgrades) created a livelock when combined with Store-Done Tracking (§4.v) and same-cache-line writes:
 
 1. A SIMD store causes cache contention. One follower succeeds (`systolic_store_done = true`), others are nacked.
 2. Nacked followers replay and retry. TileLink sends a **Probe** to the successful follower to invalidate its cached copy.
@@ -96,11 +96,16 @@ The `dcache_blocked` term in follower `stall_out` (added in commit `39c45b8e1` t
 4. `dcache_blocked` in `stall_out` → global OR-tree → **all cores freeze**, including the nacked follower trying to retry.
 5. When the Probe clears, `dcache_blocked` drops, stall releases → all cores advance together → back to step 1. Perfect Symmetry is restored.
 
-**Fix**: Gate `dcache_blocked` with `!systolic_store_done` in follower stall_out:
-```scala
-(ctrl_stalld_local && follower_pipeline_active) || (dcache_blocked && !systolic_store_done)
-```
-Done followers no longer stall the array during Probe-induced `dcache_blocked`. Nacked followers can retry independently. Store-Done's O(N) convergence is preserved. **Verified on 2026-03-23** with the unpadded `hello_systolic_flow` test (all 4 harts writing to the same cache line).
+**Attempted hardware fixes** (all failed to simultaneously fix both AXPY and systolic_flow):
+- `dcache_blocked && !systolic_store_done` — broke AXPY (permanent stall suppression after first memory op → instruction drops)
+- PC-aware `in_done_replay` with `systolic_replay_active` — AXPY cold L1 misses triggered nacks, latching the replay flag and suppressing stalls
+- Auto-clearing `systolic_store_done` — race condition cleared flag too early
+
+**Root cause**: The livelock only occurs when multiple SIMD cores write to the **same 64-byte cache line**. This is analogous to GPU shared memory bank conflicts — a well-understood constraint in parallel computing.
+
+**Fix**: Software cache-line padding. Each core's output buffer is aligned to 64-byte boundaries so cores write to separate cache lines. The hardware stall_out uses plain `dcache_blocked` (no gating). This is simple, correct for all workloads, and requires no D-cache modifications. The constraint is documented as a design requirement: *"SIMD stores must target separate cache lines."*
+
+**Verified on 2026-03-24** with `hello_systolic_flow` (padded `results[4][8]` with `__attribute__((aligned(64)))`) — all 4 harts, correct data flow ✓.
 
 ---
 
@@ -135,21 +140,35 @@ The actual fix uses two mechanisms:
 This breaks Perfect Symmetry without removing the essential re-broadcast mechanism. Self-resolving in O(N) rounds. **Verified on 2026-03-12** with both padded and unpadded tests.
 
 ## 6. Conclusion
-The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a fully hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. The D-cache contention livelock has been fully resolved via **Store-Done Tracking** with the `dcache_blocked` gate refinement, eliminating the need for software cache-line padding. The follower decode masking now correctly allows MUL instructions through the MulDiv unit. Custom CSRs dynamically expose real-time mesh data to the executable cores.
+The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-concept into a hardware-synchronized lockstep system. Follower-Fetch PC broadcast provides accurate exception tracking, WFI wakeup enables zero-overhead idle waiting, CSR pipeline flushing eliminates Leader-side NOP delays, and the **global stall OR-tree** guarantees that no broadcasted instruction is ever dropped due to D-cache misses or pipeline replays. Custom CSRs dynamically expose real-time mesh data to the executable cores.
 
-**Verified on 2026-03-23** on the `hardware-fork-join` branch with Verilator:
-- `hello_simd` — basic lockstep store-byte, all 4 harts ✓
-- `bench_axpy_simd` — AXPY with `mul` (Y = a*X + Y), all 64 elements correct, 409 cycles ✓
-- `hello_systolic_flow` — CSR data through 2×2 mesh, **same-cache-line stores** (no padding), all 4 harts ✓
+D-cache contention on same-cache-line SIMD stores is handled via **software cache-line alignment** — a well-understood constraint analogous to GPU shared memory bank padding. This avoids D-cache modifications while keeping the hardware extension minimal (~200 lines across 2 Scala files).
+
+The AXPY benchmark uses `slli`+`add` for ×3 multiplication (the `MUL` instruction path via `id_ctrl.div` is masked for followers to prevent stale-ibuf decode issues; see §4.viii). `mul`/`div` re-enablement requires decoding `id_ctrl` from the broadcast instruction rather than the stale ibuf — a future hardware change.
+
+**Verified on 2026-03-24** on the `mxu` branch with Verilator `VerilatorQuadRocketMXUConfig`:
+- `benchmark_axpy_simd` — AXPY with `slli+add` (Y = 3*X + Y), all 64 elements correct, **411 cycles** ✓
+- `benchmark_axpy_mimd` — MIMD AXPY (software fork-join), all 64 elements correct, **452 cycles** ✓
+- `hello_systolic_flow` — Systolic data through 2×2 mesh with **cache-line-padded stores**, all values correct ✓
+
+**SIMD speedup over MIMD: 9.1%** (411 vs 452 cycles) — with hyper-optimized MIMD and all software tricks.
 
 ---
 
-## 7. Next Steps: Toward GEMM Acceleration
+## 7. Next Steps
 
-With the SIMD lockstep infrastructure verified (stores, loads, MUL, systolic data flow, livelock-free cache handling), the next milestone is implementing a tiled **GEMM (General Matrix Multiply)** kernel. The systolic mesh already provides the shift-register data flow needed for the classic weight-stationary or output-stationary dataflow patterns.
+### Phase 1: SIMD Loops (Investigation — Tabled)
+Attempted enabling C for loops in SIMD mode by un-masking `id_ctrl.branch` for followers. The leader evaluates branches and re-fetches; followers should follow the broadcast. However, taken branches cause the leader to flush speculative fall-through instructions from its pipeline, while followers (with `branch := false.B`) don't flush — the speculative instructions execute on followers, causing double-computation (6×X instead of 3×X on every taken-branch iteration).
 
-### Phase 1: Software MAC Kernel
-Implement a tiled GEMM using the existing `mul` + `add` instructions in the SIMD payload. Each core accumulates a partial sum of its output tile using the existing register file. Data is staged through the systolic CSRs (`0x801` West/East, `0x802` North/South). This validates the dataflow and tiling strategy without hardware changes.
+A dedicated `leader_flush` signal was prototyped (leader broadcasts `take_pc_mem` to followers via the mesh, followers add it to `ctrl_killx`) but did not resolve the issue — the 2× pattern persisted even on the **leader's** own elements, suggesting the root cause is deeper (possibly related to pipeline timing or the BTB/no-BTB misprediction path).
 
-### Phase 2: Hardware MAC Unit
-Add a fused multiply-accumulate (MAC) unit to each core, accessible via a custom instruction or CSR-triggered operation. The MAC unit would take operands directly from the `SystolicInterface`'s `alu_opA`/`alu_opB` snooped data lines, accumulate into a local register, and write the result back — all in a single cycle. This eliminates the multi-cycle `mul` + `add` sequence and the register file pressure from manual accumulation.
+**Status**: Tabled. Unrolled SIMD is the current approach.
+
+### Phase 2: MUL Re-enablement
+Re-enable `mul`/`div` for followers by fixing `id_ctrl` to decode from the broadcast instruction (already done for `id_effective_inst` at the decoder, but the override masks need to be selectively re-enabled per the `id_ctrl` decode path).
+
+### Phase 3: GEMM Kernel
+With the SIMD lockstep infrastructure verified, implement a tiled **GEMM** kernel using the systolic mesh's shift-register data flow (CSRs `0x801`/`0x802`). Each core accumulates partial sums using the existing register file.
+
+### Phase 4: VLSI Physical Design
+Synthesize and place-and-route with Sky130 + OpenROAD to obtain area/timing/power numbers for the systolic extension versus baseline Rocket.

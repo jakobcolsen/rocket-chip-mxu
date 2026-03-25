@@ -397,8 +397,10 @@ firesim runworkload
 ```
 
 > [!TIP]
-> **Verified on 2026-03-23** with Verilator `VerilatorQuadRocketMXUConfig` on the `hardware-fork-join` branch:
-> - `hello_simd` — All 4 cores wrote `'A'+hartid` to `shared_results[hartid]` in lockstep ✓
-> - `bench_axpy_simd` — AXPY with `MUL` (Y = 3*X + Y), all 64 elements correct, 409 cycles ✓
-> - `hello_systolic_flow` — Systolic data through 2×2 mesh with **same-cache-line stores** (no padding), all values correct ✓
+> **Verified on 2026-03-24** with Verilator `VerilatorQuadRocketMXUConfig` on the `mxu` branch:
+> - `benchmark_axpy_simd` — AXPY with `slli+add` (Y = 3*X + Y), all 64 elements correct, **411 cycles** ✓
+> - `benchmark_axpy_mimd` — MIMD AXPY (software fork-join), all 64 elements correct, **452 cycles** ✓
+> - `hello_systolic_flow` — Systolic data through 2×2 mesh with **cache-line-padded stores**, all values correct ✓
+> - **SIMD speedup: 9.1%** over MIMD (411 vs 452 cycles)
+> - **Design constraint**: SIMD stores must target separate 64-byte cache lines (analogous to GPU bank padding)
 
