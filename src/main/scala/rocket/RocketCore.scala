@@ -416,6 +416,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                         id_effective_inst(14,12) === 0.U &&
                         id_effective_inst(31,25) === 0.U
 
+
   // [Fix A] Constrained SIMD Mode: Force followers to ALU/Mem/CSR (block divergence)
   when (id_systolic_follower) {
     // id_ctrl.mem := false.B // Allow MEM for printing/results
@@ -699,6 +700,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // [Systolic ALU] Auto-forward: pass mesh_west through to east_out during EX stage
   io.systolic_east_auto_wen  := ex_reg_valid && ex_reg_systolic_mul
   io.systolic_east_auto_data := io.systolic_opA
+
 
   ex_reg_valid := !ctrl_killd
   // [Fix A] Mask replay from frozen IBuf

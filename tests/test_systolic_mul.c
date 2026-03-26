@@ -75,6 +75,12 @@ int main(void) {
             "li   t2, 2                \n\t"
             "csrw 0x800, t2            \n\t"
 
+            /* Pipeline settle NOPs: SIMD activation flushes the pipeline;
+             * the MulDiv path needs 2+ cycles to stabilize before
+             * accepting SYSTOLIC_MUL requests */
+            "nop                       \n\t"
+            "nop                       \n\t"
+
             /* Load weight into t2 */
             "li   t2, 5                \n\t"
 
