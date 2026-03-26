@@ -215,6 +215,15 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       systolic_out_io.systolic_stall_out := systolic_if.io.stall_out
       systolic_if.io.core_replay_out := core.io.systolic_replay_out
       systolic_out_io.systolic_replay_out := systolic_if.io.replay_out
+      systolic_if.io.core_btb_taken_out := core.io.systolic_btb_taken_out
+      systolic_out_io.systolic_btb_taken_out := systolic_if.io.btb_taken_out
+      core.io.systolic_btb_taken_in := systolic_in_io.systolic_btb_taken
+
+      // 5. Wire Systolic ALU-to-ALU Auto-Forward
+      systolic_if.io.core_east_auto_data  := core.io.systolic_east_auto_data
+      systolic_if.io.core_east_auto_wen   := core.io.systolic_east_auto_wen
+      systolic_if.io.core_south_auto_data := core.io.systolic_south_auto_data
+      systolic_if.io.core_south_auto_wen  := core.io.systolic_south_auto_wen
   } else {
       // Tie off core systolic ports if needed, or leave disconnected if strictly input
       core.io.systolic_enable := false.B
@@ -225,6 +234,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_instruction_in := 0.U
       core.io.systolic_instruction_valid_in := false.B
       core.io.systolic_pc_in := 0.U
+      core.io.systolic_btb_taken_in := false.B
   }
 
   outer.vector_unit.foreach { v =>

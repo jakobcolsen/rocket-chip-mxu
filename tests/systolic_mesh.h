@@ -53,5 +53,15 @@ static inline void systolic_barrier(int n_cores) {
         delay(100000);
     }
 }
+/**
+ * Systolic ALU-to-ALU Instructions
+ * SYSTOLIC_MUL rd, rs1: rd = mesh_west * rs1
+ *   - mesh_west is injected as MulDiv in2 (replaces rs2)
+ *   - Auto-forwards: mesh_west → east_out, rd result → south_out
+ *   - Encoding: funct7=0000000, rs2=x0, rs1, funct3=000, rd, opcode=1011011
+ *   - Opcode 0x5b = CUSTOM2
+ */
+#define SYSTOLIC_MUL(rd, rs1)  \
+    ".insn r 0x5b, 0x0, 0x00, " rd ", " rs1 ", x0\n\t"
 
 #endif // SYSTOLIC_MESH_H

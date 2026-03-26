@@ -78,14 +78,16 @@ Custom CSRs `0x801` and `0x802` were originally masked to strictly 0 internally,
 *   **64+ cores**: A registered hierarchical stall tree (grouping cores into sub-arrays) would be needed to meet timing at high clock frequencies. This adds ~1 cycle latency per tree level.
 *   **Performance**: The stall only fires on actual D-cache misses. For compute-heavy SIMD kernels (ALU-bound), it is essentially free. Compared to the old 16-NOP gaps per instruction, throughput is significantly improved.
 
-### viii. Follower Decode Masking Bug — MUL Executed as ADD (Fixed 2026-03-23)
+### viii. Follower Decode Masking Bug — MUL Executed as ADD (Fixed 2026-03-23, Re-enabled 2026-03-25)
 The constrained SIMD masking (§2.A / tour_guide §8.D) forcefully disables dangerous control-flow operations on followers: `id_ctrl.branch := false.B`, `id_ctrl.jal := false.B`, etc. One of these overrides was `id_ctrl.div := false.B`, intended to block division on followers.
 
 **The bug**: In Rocket's decode table, `id_ctrl.div` controls the **MulDiv unit** — it gates **both** multiply and divide instructions. Setting `div = false` caused `MUL` instructions to bypass the MulDiv unit entirely. The instruction fell through to the ALU, which decoded the opcode `0110011` + funct3 `000` as `ADD`. The result: `Y[i] = X[i] + scalar` instead of `Y[i] = X[i] * scalar`.
 
 **Diagnosis**: The AXPY benchmark (`bench_axpy_simd.c`) showed `Y[16]=136, expected 167`. Manual analysis: `136 - 116(init) = 20 = 17(X[16]) + 3(scalar)`. Every follower element matched the pattern `X[i] + a` — the signature of ADD replacing MUL. The encoding difference between `MUL` and `ADD` is a single bit: funct7[0] (bit 25 of the instruction word).
 
-**Fix**: Commented out `id_ctrl.div := false.B`. The line already had a comment `// Allow MUL for systolic MAC` indicating the original intent.
+**Original fix (2026-03-23)**: Commented out `id_ctrl.div := false.B` — but was reverted because the "stale ibuf" concern remained.
+
+**Permanent fix (2026-03-25)**: Both `id_ctrl.mul := false.B` and `id_ctrl.div := false.B` removed from the follower masking block. The original concern ("decoder reads STALE ibuf") is no longer valid: the decode table input is `id_effective_inst` (line 402), which is already the broadcast instruction for followers. MUL/DIV now route correctly to the MulDiv unit on all cores.
 
 ### ix. dcache_blocked and Cache-Line Contention (Resolved via Software Padding — 2026-03-24)
 The `dcache_blocked` term in follower `stall_out` (added in commit `39c45b8e1` to prevent store loss during TileLink upgrades) created a livelock when combined with Store-Done Tracking (§4.v) and same-cache-line writes:
@@ -144,14 +146,14 @@ The Systolic Mesh SIMD architecture has evolved from a software-padded proof-of-
 
 D-cache contention on same-cache-line SIMD stores is handled via **software cache-line alignment** — a well-understood constraint analogous to GPU shared memory bank padding. This avoids D-cache modifications while keeping the hardware extension minimal (~200 lines across 2 Scala files).
 
-The AXPY benchmark uses `slli`+`add` for ×3 multiplication (the `MUL` instruction path via `id_ctrl.div` is masked for followers to prevent stale-ibuf decode issues; see §4.viii). `mul`/`div` re-enablement requires decoding `id_ctrl` from the broadcast instruction rather than the stale ibuf — a future hardware change.
+The AXPY benchmark now uses real `mul` instructions — `id_ctrl.mul`/`id_ctrl.div` masks were removed for followers since the decoder already reads `id_effective_inst` (the broadcast instruction). See §4.viii for full history.
 
-**Verified on 2026-03-24** on the `mxu` branch with Verilator `VerilatorQuadRocketMXUConfig`:
-- `benchmark_axpy_simd` — AXPY with `slli+add` (Y = 3*X + Y), all 64 elements correct, **411 cycles** ✓
+**Verified on 2026-03-25** on the `mxu` branch with Verilator `VerilatorQuadRocketMXUConfig`:
+- `benchmark_axpy_simd` — AXPY with real **`mul`** (Y = 3*X + Y), all 64 elements correct, **409 cycles** ✓
 - `benchmark_axpy_mimd` — MIMD AXPY (software fork-join), all 64 elements correct, **452 cycles** ✓
 - `hello_systolic_flow` — Systolic data through 2×2 mesh with **cache-line-padded stores**, all values correct ✓
 
-**SIMD speedup over MIMD: 9.1%** (411 vs 452 cycles) — with hyper-optimized MIMD and all software tricks.
+**SIMD speedup over MIMD: 9.5%** (409 vs 452 cycles) — with hyper-optimized MIMD and all software tricks.
 
 ---
 
@@ -164,11 +166,8 @@ A dedicated `leader_flush` signal was prototyped (leader broadcasts `take_pc_mem
 
 **Status**: Tabled. Unrolled SIMD is the current approach.
 
-### Phase 2: MUL Re-enablement
-Re-enable `mul`/`div` for followers by fixing `id_ctrl` to decode from the broadcast instruction (already done for `id_effective_inst` at the decoder, but the override masks need to be selectively re-enabled per the `id_ctrl` decode path).
+### Phase 2: MUL Re-enablement ✅ (Completed 2026-03-25)
+`id_ctrl.mul` and `id_ctrl.div` masks removed from follower masking block. The decoder already reads `id_effective_inst` (broadcast instruction), so the stale-ibuf concern was invalid. Verified with real `mul` in AXPY — 409 cycles, all 64 elements correct.
 
 ### Phase 3: GEMM Kernel
-With the SIMD lockstep infrastructure verified, implement a tiled **GEMM** kernel using the systolic mesh's shift-register data flow (CSRs `0x801`/`0x802`). Each core accumulates partial sums using the existing register file.
-
-### Phase 4: VLSI Physical Design
-Synthesize and place-and-route with Sky130 + OpenROAD to obtain area/timing/power numbers for the systolic extension versus baseline Rocket.
+With MUL working and the SIMD lockstep infrastructure verified, implement a tiled **GEMM** kernel using the systolic mesh's shift-register data flow (CSRs `0x801`/`0x802`). Each core accumulates partial sums using the existing register file.

@@ -23,6 +23,8 @@
 #define N            64          /* total elements */
 #define SLICE        (N / NUM_CORES)  /* 16 per core */
 #define SCALAR_A     3
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x)  _STRINGIFY(x)
 
 /* ── CSR helpers ─────────────────────────────────────────────────── */
 #define read_csr(reg) ({ unsigned long __tmp; \
@@ -48,18 +50,17 @@ void thread_entry(int cid, int nc) {
  *   t1 = base pointer into Y (for this core's slice)
  *   t3, t4 = temporaries
  *
- * NOTE: mul is broken in SIMD mode — Rocket's PipelinedMultiplier
- * has no stall input, so it desynchronizes from the main pipeline
- * during D-cache miss stalls on follower cores. The leader works
- * because its D-cache is warm. Use slli+add instead.
+ * MUL re-enabled for SIMD followers (2026-03-25): the decoder reads
+ * id_effective_inst (broadcast instruction), so id_ctrl.mul/div are
+ * no longer masked. Uses real mul instruction instead of slli+add.
  *
- * Each element: lw t3, off(t0);  slli t4, t3, 1;  add t3, t4, t3;
+ * Each element: lw t3, off(t0);  mul t3, t3, t2;
  *               lw t4, off(t1);  add t3, t3, t4;  sw t3, off(t1)
+ * t2 = SCALAR_A (loaded once before unrolled loop)
  */
 #define AXPY_ONE(byte_off) \
     "lw   t3, " #byte_off "(t0) \n\t" \
-    "slli t4, t3, 1             \n\t" \
-    "add  t3, t4, t3            \n\t" \
+    "mul  t3, t3, t2            \n\t" \
     "lw   t4, " #byte_off "(t1) \n\t" \
     "add  t3, t3, t4            \n\t" \
     "sw   t3, " #byte_off "(t1) \n\t"
@@ -123,6 +124,8 @@ int main(void) {
             "la   t1, Y               \n\t"
             "add  t1, t1, t5           \n\t"
 
+            /* Load scalar multiplier into t2 (reuse after csrw) */
+            "li   t2, " STRINGIFY(SCALAR_A) "  \n\t"
 
             /* Unrolled AXPY: 16 elements × 4 bytes = offsets 0..60 */
             AXPY_ONE(0)
@@ -145,7 +148,7 @@ int main(void) {
             "fence rw, rw              \n\t"
             :
             :
-            : "t0", "t1", "t3", "t4", "t5", "memory"
+            : "t0", "t1", "t2", "t3", "t4", "t5", "memory"
         );
 
         /* Deactivate SIMD */

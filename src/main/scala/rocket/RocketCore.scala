@@ -125,10 +125,10 @@ class RocketCustomCSRs(implicit p: Parameters) extends CustomCSRs with HasRocket
   def systolicCSR = CustomCSR(0x800, BigInt(3), Some(BigInt(0))) // Address 0x800, Bit 0 & 1 writable
 
   // Systolic Data CSR: West/East axis (read West register, write East register)
-  def systolicDataCSR = CustomCSR(0x801, BigInt("FFFFFFFFFFFFFFFF", 16), Some(BigInt(0)))
+  def systolicDataCSR = CustomCSR(0x801, (BigInt(1) << rocketParams.xLen) - 1, Some(BigInt(0)))
 
   // Systolic Data CSR: North/South axis (read North register, write South register)
-  def systolicDataCSR_NS = CustomCSR(0x802, BigInt("FFFFFFFFFFFFFFFF", 16), Some(BigInt(0)))
+  def systolicDataCSR_NS = CustomCSR(0x802, (BigInt(1) << rocketParams.xLen) - 1, Some(BigInt(0)))
 
   def systolicMasterCtrl = getByIdOrElse(0x800, _.value(0), false.B)
   def systolicSimdMode   = getByIdOrElse(0x800, _.value(1), false.B)
@@ -186,7 +186,14 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val systolic_data_wen    = Output(Bool())         // East write-enable
     val systolic_south_data_out = Output(UInt(xLen.W)) // South write data (CSR 0x802)
     val systolic_south_data_wen = Output(Bool())       // South write-enable
+    val systolic_btb_taken_out = Output(Bool())        // Leader BTB prediction
+    val systolic_btb_taken_in  = Input(Bool())         // Leader BTB prediction broadcast
 
+    // Systolic ALU-to-ALU Auto-Forward
+    val systolic_east_auto_data  = Output(UInt(xLen.W))  // Pass-through mesh_west → east
+    val systolic_east_auto_wen   = Output(Bool())
+    val systolic_south_auto_data = Output(UInt(xLen.W))  // MUL result → south
+    val systolic_south_auto_wen  = Output(Bool())
 
   })
 }
@@ -265,6 +272,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     (if (fLen >= 64)    new DDecode +: (xLen > 32).option(new D64Decode).toSeq else Nil) ++:
     (if (minFLen == 16) new HDecode +: (xLen > 32).option(new H64Decode).toSeq ++: (fLen >= 64).option(new HDDecode).toSeq else Nil) ++:
     (usingRoCC.option(new RoCCDecode)) ++:
+    (if (usingMulDiv) Seq(new SystolicDecode(pipelinedMul)) else Nil) ++:
     (if (xLen == 32) new I32Decode else new I64Decode) +:
     (usingVM.option(new SVMDecode)) ++:
     (usingSupervisor.option(new SDecode)) ++:
@@ -302,6 +310,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ex_reg_inst = RegInit(0.U(32.W))
   val ex_reg_raw_inst = RegInit(0.U(32.W))
   val ex_reg_systolic_follower = RegInit(false.B)
+  val ex_reg_systolic_mul     = RegInit(false.B)
   val ex_reg_wphit            = RegInit(0.U.asTypeOf(Vec(nBreakpoints, Bool())))
   val ex_reg_set_vconfig      = RegInit(false.B)
 
@@ -321,6 +330,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_reg_pc = RegInit(0.U)
   val mem_reg_inst = RegInit(0.U(32.W))
   val mem_reg_systolic_follower = RegInit(false.B)
+  val mem_reg_systolic_mul     = RegInit(false.B)
   val mem_reg_mem_size = RegInit(0.U)
   val mem_reg_hls_or_dv = RegInit(false.B)
   val mem_reg_raw_inst = RegInit(0.U(32.W))
@@ -401,10 +411,18 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   require(!(coreParams.useRVE && coreParams.useHypervisor), "Can't select both RVE and Hypervisor")
   val id_ctrl = Wire(new IntCtrlSigs).decode(id_effective_inst, decode_table)
 
+  // Detect SYSTOLIC_MUL: opcode=1011011 (CUSTOM2), funct3=000, funct7=0000000
+  val id_systolic_mul = id_effective_inst(6,0) === "b1011011".U &&
+                        id_effective_inst(14,12) === 0.U &&
+                        id_effective_inst(31,25) === 0.U
+
   // [Fix A] Constrained SIMD Mode: Force followers to ALU/Mem/CSR (block divergence)
   when (id_systolic_follower) {
     // id_ctrl.mem := false.B // Allow MEM for printing/results
-    id_ctrl.branch := false.B
+    // id_ctrl.branch un-masked: followers evaluate branches locally for loops.
+    // The leader broadcasts its BTB prediction (systolic_btb_taken_in), which
+    // is injected into the follower's pipeline. The follower locally kills
+    // speculative EX instructions if the branch mispredicts.
     id_ctrl.jal := false.B
     id_ctrl.jalr := false.B
     // id_ctrl.csr := CSR.N   // Allow CSR for mhartid
@@ -412,8 +430,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     id_ctrl.fence_i := false.B
     id_ctrl.amo := false.B
     id_ctrl.fp := false.B
-    id_ctrl.mul := false.B   // Must stay masked: decoder reads STALE ibuf (not broadcast)
-    id_ctrl.div := false.B   // Must stay masked: decoder reads STALE ibuf (not broadcast)
+    // id_ctrl.mul and id_ctrl.div: UN-MASKED as of 2026-03-25.
+    // The decoder reads id_effective_inst (broadcast instruction), not stale ibuf.
+    // MUL/DIV now route correctly to the MulDiv unit on followers.
     id_ctrl.rocc := false.B
     id_ctrl.vec := false.B
     // Note: wxd is NOT overridden — the decoder naturally produces wxd=true
@@ -667,7 +686,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   div.io.req.bits.dw := ex_ctrl.alu_dw
   div.io.req.bits.fn := ex_ctrl.alu_fn
   div.io.req.bits.in1 := ex_rs(0)
-  div.io.req.bits.in2 := ex_rs(1)
+  // [Systolic ALU] For SYSTOLIC_MUL: substitute mesh_west for rs2 (in2)
+  div.io.req.bits.in2 := Mux(ex_reg_systolic_mul, io.systolic_opA, ex_rs(1))
   div.io.req.bits.tag := ex_waddr
   val mul = pipelinedMul.option {
     val m = Module(new PipelinedMultiplier(xLen, 2))
@@ -675,6 +695,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     m.io.req.bits := div.io.req.bits
     m
   }
+
+  // [Systolic ALU] Auto-forward: pass mesh_west through to east_out during EX stage
+  io.systolic_east_auto_wen  := ex_reg_valid && ex_reg_systolic_mul
+  io.systolic_east_auto_data := io.systolic_opA
 
   ex_reg_valid := !ctrl_killd
   // [Fix A] Mask replay from frozen IBuf
@@ -737,8 +761,17 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     ex_reg_pc := id_effective_pc
     ex_reg_btb_resp := ibuf.io.btb_resp
     ex_reg_systolic_follower := id_systolic_follower
+    ex_reg_systolic_mul := id_systolic_mul
     ex_reg_wphit := bpu.io.bpwatch.map { bpw => bpw.ivalid(0) }
     ex_reg_set_vconfig := id_set_vconfig && !id_xcpt
+
+    // [SIMD Loop] For followers, override the BTB prediction with the Leader's
+    // broadcasted BTB prediction. This ensures the Follower knows whether the
+    // instruction currently fetched was a Target or a Fall-through, allowing
+    // cycle-independent, slip-tolerant local branch kills!
+    when (id_systolic_follower && io.systolic_enable) {
+      ex_reg_btb_resp.taken := io.systolic_btb_taken_in
+    }
   }
 
   // replay inst in ex stage?
@@ -749,7 +782,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                              ex_ctrl.vec && !io.vector.map(_.ex.ready).getOrElse(true.B)
   val replay_ex_load_use = wb_dcache_miss && ex_reg_load_use
   val replay_ex = ex_reg_replay || (ex_reg_valid && (replay_ex_structural || replay_ex_load_use))
-  val ctrl_killx = take_pc_mem_wb || replay_ex || !ex_reg_valid
+  // [SIMD Loop] Slip-tolerant branch flush. Followers evaluate branches locally.
+  // We use the Leader's broadcasted BTB prediction (injected into ex_reg_btb_resp
+  // and passed to mem_reg_btb_resp) to natively determine if the branch mispredicted.
+  // Because pipeline slip can occur, the kill decision MUST be made locally
+  // using the Follower's own pipeline state and the Leader's prediction marker.
+  val follower_branch_kill = mem_reg_valid && mem_reg_systolic_follower && mem_ctrl.branch && mem_br_taken =/= (usingBTB.B && mem_reg_btb_resp.taken)
+  val ctrl_killx = take_pc_mem_wb || replay_ex || !ex_reg_valid || follower_branch_kill
   // detect 2-cycle load-use delay for LB/LH/SC
   val ex_slow_bypass = ex_ctrl.mem_cmd === M_XSC || ex_reg_mem_size < 2.U
   val ex_sfence = usingVM.B && ex_ctrl.mem && (ex_ctrl.mem_cmd === M_SFENCE || ex_ctrl.mem_cmd === M_HFENCEV || ex_ctrl.mem_cmd === M_HFENCEG)
@@ -776,7 +815,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_cfi_taken = (mem_ctrl.branch && mem_br_taken) || mem_ctrl.jalr || mem_ctrl.jal
   val mem_direction_misprediction = mem_ctrl.branch && mem_br_taken =/= (usingBTB.B && mem_reg_btb_resp.taken)
   val mem_misprediction = if (usingBTB) mem_wrong_npc else mem_cfi_taken
-  take_pc_mem := mem_reg_valid && !mem_reg_xcpt && (mem_misprediction || mem_reg_sfence)
+  take_pc_mem := mem_reg_valid && !mem_reg_xcpt && ((mem_misprediction && !id_systolic_follower) || mem_reg_sfence)
 
   mem_reg_valid := !ctrl_killx
   mem_reg_replay := !take_pc_mem_wb && replay_ex
@@ -799,6 +838,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_wphit := ex_reg_wphit
     mem_reg_set_vconfig := ex_reg_set_vconfig
     mem_reg_systolic_follower := ex_reg_systolic_follower
+    mem_reg_systolic_mul := ex_reg_systolic_mul
 
     mem_reg_cause := ex_cause
     mem_reg_inst := ex_reg_inst
@@ -1299,7 +1339,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                                 mem_npc))    // flush or branch misprediction
   io.imem.flush_icache := wb_reg_valid && wb_ctrl.fence_i && !io.dmem.s2_nack
   io.imem.might_request := {
-    imem_might_request_reg := ex_pc_valid || mem_pc_valid || io.ptw.customCSRs.disableICacheClockGate || io.vector.map(_.trap_check_busy).getOrElse(false.B)
+    imem_might_request_reg := ex_pc_valid || mem_pc_valid || io.ptw.customCSRs.disableICacheClockGate || io.vector.map(_.trap_check_busy).getOrElse(false.B) || io.systolic_enable
     imem_might_request_reg
   }
   io.imem.progress := RegNext(wb_reg_valid && !replay_wb_common)
@@ -1591,6 +1631,18 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // Instruction Broadcast Export
     io.systolic_instruction_out := id_inst(0)
     io.systolic_instruction_valid_out := is_leader && !ctrl_killd
+
+    // [SIMD Loop] Broadcast leader's BTB prediction to followers
+    io.systolic_btb_taken_out := is_leader && ibuf.io.btb_resp.taken
+
+    // [Systolic ALU] Auto-forward: write MUL result to south_out on WB commit
+    // wb_reg_systolic_mul is set when a SYSTOLIC_MUL instruction reaches WB
+    val wb_reg_systolic_mul = RegInit(false.B)
+    when (mem_pc_valid) {
+      wb_reg_systolic_mul := mem_reg_systolic_mul
+    }
+    io.systolic_south_auto_wen  := wb_reg_valid && wb_reg_systolic_mul && !wb_xcpt
+    io.systolic_south_auto_data := rf_wdata  // the MUL result being written to rd
 
 
 
