@@ -11,6 +11,7 @@ import chisel3.experimental.dataview._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.rocket.Instructions._
+import freechips.rocketchip.rocket.CustomInstructions._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property
 
@@ -164,13 +165,19 @@ class FPUDecoder(implicit p: Parameters) extends FPUModule()(p) {
   val vfmv_f_s: Array[(BitPat, List[BitPat])] =
     Array(VFMV_F_S -> List(N,Y,N,N,N,N,X,X2,X2,N,N,N,N,N,N,N,Y))
 
+  // Systolic FP instructions: FMUL uses FMA pipe with in3=0, FMAC uses all 3 operands
+  // ren1=Y (read fs1 as weight), ren2=N, ren3=N, fma=Y, wflags=Y, typeTagIn/Out=S
+  val systolic_fp: Array[(BitPat, List[BitPat])] =
+    Array(SYSTOLIC_FMUL_S -> List(N,Y,Y,N,N,N,N, S, S,N,N,N,Y,N,N,Y,N),
+          SYSTOLIC_FMAC_S -> List(N,Y,Y,N,N,N,N, S, S,N,N,N,Y,N,N,Y,N))
+
   val insns = ((minFLen, fLen) match {
     case (32, 32) => f
     case (16, 32) => h ++ f
     case (32, 64) => f ++ d
     case (16, 64) => h ++ f ++ d ++ fcvt_hd
     case other => throw new Exception(s"minFLen = ${minFLen} & fLen = ${fLen} is an unsupported configuration")
-  }) ++ (if (usingVector) vfmv_f_s else Array[(BitPat, List[BitPat])]())
+  }) ++ (if (usingVector) vfmv_f_s else Array[(BitPat, List[BitPat])]()) ++ systolic_fp
   val decoder = DecodeLogic(io.inst, default, insns)
   val s = io.sigs
   val sigs = Seq(s.ldst, s.wen, s.ren1, s.ren2, s.ren3, s.swap12,
@@ -211,6 +218,16 @@ class FPUCoreIO(implicit p: Parameters) extends CoreBundle()(p) {
   val sboard_clra = Output(UInt(5.W))
 
   val keep_clock_enabled = Input(Bool())
+
+  // Systolic mesh FP ports
+  val systolic_opA        = Input(UInt(64.W))   // mesh_west IEEE bits
+  val systolic_opB        = Input(UInt(64.W))   // mesh_north IEEE bits (for FMAC)
+  val systolic_fp_mul     = Input(Bool())        // SYSTOLIC_FMUL_S in EX
+  val systolic_fp_mac     = Input(Bool())        // SYSTOLIC_FMAC_S in EX
+  val systolic_south_data_fp = Output(UInt(64.W)) // IEEE result for south_out
+  val systolic_south_wen_fp  = Output(Bool())     // WEN for south mesh register
+  val systolic_east_data_fp  = Output(UInt(64.W)) // pass-through for east_out
+  val systolic_east_wen_fp   = Output(Bool())     // WEN for east mesh register
 }
 
 class FPUIO(implicit p: Parameters) extends FPUCoreIO ()(p) {
@@ -769,6 +786,12 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
   val ex_reg_ctrl = RegEnable(id_ctrl, io.valid)
   val ex_ra = List.fill(3)(Reg(UInt()))
 
+  // Debug: verify systolic signals at FPU module boundary (OUTSIDE gated clock)
+  when (io.systolic_fp_mul || io.systolic_fp_mac) {
+    printf("FPU_BOUNDARY: hart=%d mul=%d mac=%d valid=%d ex_valid=%d\n",
+      io.hartid, io.systolic_fp_mul, io.systolic_fp_mac, io.valid, ex_reg_valid)
+  }
+
   // load/vector response
   val load_wb = RegNext(io.ll_resp_val)
   val load_wb_typeTag = RegEnable(io.ll_resp_type(1,0) - typeTagWbOffset, io.ll_resp_val)
@@ -844,6 +867,21 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
   }
   val ex_rm = Mux(ex_reg_inst(14,12) === 7.U, io.fcsr_rm, ex_reg_inst(14,12))
 
+  // Track systolic FP flags through the pipeline
+  val ex_systolic_fp = io.systolic_fp_mul || io.systolic_fp_mac
+
+  val mem_reg_systolic_fp = RegNext(ex_systolic_fp && ex_reg_valid && !killx, false.B)
+  val wb_reg_systolic_fp  = RegNext(mem_reg_systolic_fp && !killm, false.B)
+  val mem_reg_systolic_opA = RegEnable(io.systolic_opA, ex_systolic_fp && ex_reg_valid && !killx)
+
+  when (ex_systolic_fp) {
+    printf("SYS_FP_EX: hart=%d mul=%d mac=%d exv=%d killx=%d io_killx=%d mem_v=%d killm=%d => mem_sys=%d\n",
+      io.hartid, io.systolic_fp_mul, io.systolic_fp_mac, ex_reg_valid, killx, io.killx,
+      mem_reg_valid, killm, ex_systolic_fp && ex_reg_valid && !killx)
+  }
+
+
+
   def fuInput(minT: Option[FType]): FPInput = {
     val req = Wire(new FPInput)
     val tag = ex_ctrl.typeTagIn
@@ -865,6 +903,21 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
         req.in2 := io.cp_req.bits.in3
         req.in3 := io.cp_req.bits.in2
       }
+    }
+    // [Systolic FP] Override operands for SYSTOLIC_FMUL_S / SYSTOLIC_FMAC_S
+    when (ex_systolic_fp) {
+      // in1 = fs1 (weight from FP regfile, already set above)
+      // in2 = mesh_west (recode from IEEE to hardfloat)
+      req.in2 := FType.S.recode(io.systolic_opA(31, 0))
+      // in3 = mesh_north for FMAC, or positive zero for FMUL
+      when (io.systolic_fp_mac) {
+        req.in3 := FType.S.recode(io.systolic_opB(31, 0))
+        req.ren3 := true.B
+      } .otherwise {
+        // Positive zero in recoded format
+        req.in3 := 0.U((FType.S.recodedWidth).W)
+      }
+      req.fmaCmd := 0.U  // FMADD: in1 * in2 + in3
     }
     req
   }
@@ -934,11 +987,14 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
     val typeTag = UInt(log2Up(floatTypes.size).W)
     val cp = Bool()
     val pipeid = UInt(log2Ceil(pipes.size).W)
+    val systolic = Bool()
+    val sys_opA = UInt(64.W)
   }
 
   val wen = RegInit(0.U((maxLatency-1).W))
   val wbInfo = Reg(Vec(maxLatency-1, new WBInfo))
   val mem_wen = mem_reg_valid && (mem_ctrl.fma || mem_ctrl.fastpipe || mem_ctrl.fromint)
+
   val write_port_busy = RegEnable(mem_wen && (memLatencyMask & latencyMask(ex_ctrl, 1)).orR || (wen & latencyMask(ex_ctrl, 0)).orR, req_valid)
   ccover(mem_reg_valid && write_port_busy, "WB_STRUCTURAL", "structural hazard on writeback")
 
@@ -956,6 +1012,8 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
         wbInfo(i).typeTag := mem_ctrl.typeTagOut
         wbInfo(i).pipeid := pipeid(mem_ctrl)
         wbInfo(i).rd := mem_reg_inst(11,7)
+        wbInfo(i).systolic := mem_reg_systolic_fp
+        wbInfo(i).sys_opA := mem_reg_systolic_opA
       }
     }
   }
@@ -974,6 +1032,19 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
     frfWriteBundle(1).wrdst := waddr
     frfWriteBundle(1).wrenf := true.B
     frfWriteBundle(1).wrdata := ieee(wdata)
+  }
+
+  // [Systolic FP] Drive south_out with un-recoded IEEE result on systolic writeback
+  io.systolic_south_wen_fp  := wen(0) && wbInfo(0).systolic && !wbInfo(0).cp
+  io.systolic_south_data_fp := Cat(0.U(32.W), ieee(wdata)(31, 0))  // zero-extend SP to 64-bit
+  
+  // [Systolic FP] Drive east_out with pipelined mesh_west at WB stage (synchronized with south)
+  io.systolic_east_wen_fp   := io.systolic_south_wen_fp
+  io.systolic_east_data_fp  := wbInfo(0).sys_opA
+
+  when (io.systolic_south_wen_fp) {
+    printf("SOUTH_FWD: hart=%d data=%x ieee=%x rd=%d east_fw_data=%x\n",
+      io.hartid, io.systolic_south_data_fp, ieee(wdata), wbInfo(0).rd, io.systolic_east_data_fp)
   }
   if (useDebugROB) {
     DebugROB.pushWb(clock, reset, io.hartid, (!wbInfo(0).cp && wen(0)) || divSqrt_wen, waddr + 32.U, ieee(wdata))

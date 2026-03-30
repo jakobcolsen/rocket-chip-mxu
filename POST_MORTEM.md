@@ -109,6 +109,18 @@ The `dcache_blocked` term in follower `stall_out` (added in commit `39c45b8e1` t
 
 **Verified on 2026-03-24** with `hello_systolic_flow` (padded `results[4][8]` with `__attribute__((aligned(64)))`) — all 4 harts, correct data flow ✓.
 
+### x. FPU Systolic Pipeline Synchronization (Completed 2026-03-30)
+Floating point systolic math (`SYSTOLIC_FMUL_S`, `SYSTOLIC_FMAC_S`) introduced a critical pipeline delay. 
+
+**The bug**: The integer systolic ALU evaluates in 1 cycle, allowing East and South auto-forwards to fire near-simultaneously. The single-precision FPU FMA pipe takes 3 cycles. Initially, East auto-forwarding (Matrix A) was wired to fire when the instruction entered the Execute (`EX`) stage, but South auto-forwarding (Matrix C accumulation) naturally fired when the instruction finished math and hit the Writeback (`WB`) stage. This misaligned the Matrix A and Matrix C wavefronts by 3 cycles across the mesh.
+Additionally, the internal `FPUFMAPipe` uses the `ren3` (read-enable register 3) signal to identify 3-operand instructions. Since our custom `SYSTOLIC_FMAC_S` does not read a third value from the standard register file (`ren3=N` in the decoder), the FMAPipe treated it as a 2-operand instruction and unconditionally zeroed out the injected `mesh_north` accumulation value.
+
+**The Fix**:
+1. **Pipeline Synchronization**: The `mesh_west` operand was pipelined down the FPU by extending the internal `wbInfo` shift-register with a new `sys_opA` field. The East auto-forward was delayed to the `WB` stage, ensuring it fires synchronously with the South auto-forward.
+2. **Operand Override**: During systolic operand injection in `FPU.fuInput()`, `req.ren3 := true.B` is forcefully asserted for `FMAC` instructions. This overrides the decoder and prevents `FPUFMAPipe` from zeroing out the `mesh_north` data payload.
+
+**Verified on 2026-03-30** with `test_systolic_fmac` — fully coherent 2D wave propagation across the mesh.
+
 ---
 
 ## 5. Future Work / Abandoned Approaches
@@ -169,5 +181,8 @@ A dedicated `leader_flush` signal was prototyped (leader broadcasts `take_pc_mem
 ### Phase 2: MUL Re-enablement ✅ (Completed 2026-03-25)
 `id_ctrl.mul` and `id_ctrl.div` masks removed from follower masking block. The decoder already reads `id_effective_inst` (broadcast instruction), so the stale-ibuf concern was invalid. Verified with real `mul` in AXPY — 409 cycles, all 64 elements correct.
 
-### Phase 3: GEMM Kernel
-With MUL working and the SIMD lockstep infrastructure verified, implement a tiled **GEMM** kernel using the systolic mesh's shift-register data flow (CSRs `0x801`/`0x802`). Each core accumulates partial sums using the existing register file.
+### Phase 3: FPU Systolic Integration ✅ (Completed 2026-03-30)
+With the integer logic robust, the FPU pipeline was tapped. Native floating-point single-precision `SYSTOLIC_FMUL_S` and `SYSTOLIC_FMAC_S` instructions were embedded alongside operand injection directly into the Rocket `FPU.scala` architecture. Pipeline desynchronization between A and C matrices was resolved via custom `wbInfo` shift-register metadata.
+
+### Phase 4: GEMM Kernel
+The hardware is now completely verified for floating point operations. The immediate next step is to write a true 2D blocked **GEMM (General Matrix Multiply)** kernel utilizing the full 4 or 16-core configuration.

@@ -43,7 +43,12 @@ _start:
     li  t5, 0
     li  t6, 0
 
-    # 4. Set up stack pointer (8KB per core)
+    # 4. Enable FPU on ALL cores (set mstatus.FS = Initial)
+    # This must happen before cores diverge to WFI for SIMD FP support
+    li  t0, 0x6000       # FS field = bits [14:13]
+    csrs mstatus, t0
+
+    # 5. Set up stack pointer (8KB per core)
     # Use 0x80100000 (1MB offset) to be safe within smaller DRAM configs
     csrr a0, mhartid
     li  t0, 0x2000      # 8KB stack size per hart

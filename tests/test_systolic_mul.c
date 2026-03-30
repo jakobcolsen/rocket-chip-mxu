@@ -68,18 +68,11 @@ int main(void) {
         printf("=== SYSTOLIC_MUL Smoke Test ===\n\n");
         printf("Pre-loaded: Hart 0 East=7\n");
         printf("Weight (rs1) = 5 for all cores\n\n");
-
         // Phase 2: SIMD — execute SYSTOLIC_MUL
         printf("ACTIVATING SIMD\n");
         asm volatile(
             "li   t2, 2                \n\t"
             "csrw 0x800, t2            \n\t"
-
-            /* Pipeline settle NOPs: SIMD activation flushes the pipeline;
-             * the MulDiv path needs 2+ cycles to stabilize before
-             * accepting SYSTOLIC_MUL requests */
-            "nop                       \n\t"
-            "nop                       \n\t"
 
             /* Load weight into t2 */
             "li   t2, 5                \n\t"

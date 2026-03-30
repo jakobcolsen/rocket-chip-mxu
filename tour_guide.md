@@ -336,6 +336,11 @@ io.systolic_pc_out := ibuf.io.pc
 ```
 - **What it does:** At the very bottom of the core file, we wire the outputs. Core 0 (`is_leader`) takes the instruction currently in its decode stage (`id_inst(0)`) and sends it out to the Mesh (`systolic_instruction_out`) alongside its active PC (`systolic_pc_out`). It is only flagged as `valid` if it wasn't killed by a stall or branch misprediction (`!ctrl_killd`).
 
+### J. FPU Integration & Systolic Pipeline Synchronization
+To support floating-point matrix math (`SYSTOLIC_FMUL_S`, `SYSTOLIC_FMAC_S`), the SIMD extension hacks directly into the Rocket `FPU.scala` pipeline.
+- **Operand Override (`fuInput`)**: When a systolic FP instruction enters the Execute (EX) stage, standard register-file reads for `rs2` and `rs3` are bypassed and replaced by the `mesh_west` and `mesh_north` float data entering from the 2D mesh. Furthermore, `req.ren3 := true.B` is forcefully asserted to trick the internal `FPUFMAPipe` into treating `FMAC` as a 3-operand instruction, preventing it from zeroing out the `mesh_north` accumulation value.
+- **Pipeline Delay Alignment**: Unlike integer ALUs (typically 1-cycle), the single-precision FMA pipe takes 3 cycles. Initially, East auto-forwarding (Matrix A) was wired to fire in the EX stage, while South auto-forwarding (Matrix C) fired in the WB stage, misaligning the wavefronts by 3 cycles. To maintain mathematically perfect systolic data flow, the `mesh_west` operand is stored into a new `sys_opA` field in the FPU's internal `wbInfo` shift-register. Both East and South auto-forwards now fire perfectly synchronously when the instruction finally commits in the Writeback (WB) stage.
+
 ---
 
 ## 🚀 Summary of the Data Flow

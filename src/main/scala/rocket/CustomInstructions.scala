@@ -38,6 +38,11 @@ object CustomInstructions {
   // Systolic ALU-to-ALU instructions (CUSTOM2 opcode space, specific funct7/funct3)
   // SYSTOLIC_MUL rd, rs1: rd = mesh_west * rs1; auto-forward west→east, rd→south
   def SYSTOLIC_MUL       = BitPat("b0000000??????????000?????1011011")
+  // SYSTOLIC_FMUL_S fd, fs1: fd = mesh_west * fs1 (single-precision FP)
+  // funct7=0000100: bits [26:25]=00 must be single-precision format for FPU compatibility
+  def SYSTOLIC_FMUL_S    = BitPat("b0000100??????????000?????1011011")
+  // SYSTOLIC_FMAC_S fd, fs1: fd = mesh_west * fs1 + mesh_north (single-precision FP FMA)
+  def SYSTOLIC_FMAC_S    = BitPat("b0001000??????????000?????1011011")
 }
 
 object CustomCSRs {
