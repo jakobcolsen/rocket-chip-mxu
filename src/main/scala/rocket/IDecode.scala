@@ -523,6 +523,25 @@ class ZbsDecode(implicit val p: Parameters) extends DecodeConstants
   )
 }
 
+class SystolicDecode(pipelinedMul: Boolean)(implicit val p: Parameters) extends DecodeConstants
+{
+  val M = if (pipelinedMul) Y else N
+  val D = if (pipelinedMul) N else Y
+  // SYSTOLIC_MUL: rd = mesh_west * rs1 (weight from register file, mesh data injected in core)
+  // rxs1=Y (read weight), rxs2=N (mesh operand injected), mul=M/div=D (MulDiv pipeline), wxd=Y (write rd)
+  val table: Array[(BitPat, List[BitPat])] = Array(
+    SYSTOLIC_MUL-> List(Y,N,N,N,N,N,N,Y,A2_ZERO,A1_RS1, IMM_X, DW_XPR,FN_MUL,   N,M_X,        N,N,N,N,M,D,Y,CSR.N,N,N,N,N))
+}
+
+class SystolicFPDecode(implicit val p: Parameters) extends DecodeConstants
+{
+  // SYSTOLIC_FMUL_S / SYSTOLIC_FMAC_S: fp=Y, rfs1=Y, rfs2=N, rfs3=N, wfd=Y
+  // These route entirely through the FPU pipeline; no integer ALU/MulDiv involvement
+  val table: Array[(BitPat, List[BitPat])] = Array(
+    SYSTOLIC_FMUL_S-> List(Y,Y,N,N,N,N,N,N,A2_X,   A1_X,   IMM_X, DW_X,  FN_X,     N,M_X,        Y,N,N,Y,N,N,N,CSR.N,N,N,N,N),
+    SYSTOLIC_FMAC_S-> List(Y,Y,N,N,N,N,N,N,A2_X,   A1_X,   IMM_X, DW_X,  FN_X,     N,M_X,        Y,N,N,Y,N,N,N,CSR.N,N,N,N,N))
+}
+
 class RoCCDecode(implicit val p: Parameters) extends DecodeConstants
 {
   val table: Array[(BitPat, List[BitPat])] = Array(

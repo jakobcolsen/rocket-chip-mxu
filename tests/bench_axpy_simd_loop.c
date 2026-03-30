@@ -97,15 +97,15 @@ int main(void) {
         if (passed) {
             printf("Verification PASSED — all %d elements correct.\n", N);
             printf("\n*** PASSED ***\n");
+            return 42;
         } else {
             printf("Verification FAILED!\n");
             printf("*** FAILED ***\n");
+            return 1;
         }
 
     } else {
         /* Followers: sleep until SIMD wakes them */
         while (1) { asm volatile("wfi"); }
     }
-
-    return 0;
 }

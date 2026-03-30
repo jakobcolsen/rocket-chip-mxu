@@ -15,6 +15,7 @@ class SystolicInputBundle(implicit p: Parameters) extends Bundle {
   val instruction      = UInt(32.W)       // Instruction from Leader
   val instruction_valid = Bool()          // Leader is executing
   val pc               = UInt(64.W)       // Leader's Program Counter
+  val systolic_btb_taken = Bool()         // Leader's BTB prediction (1=taken)
 }
 
 // Flows from Tile -> Mesh Network
@@ -28,6 +29,7 @@ class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
   val instruction      = UInt(32.W)       // Instruction from Leader
   val instruction_valid = Bool()          // Leader is executing
   val pc               = UInt(64.W)       // Leader's Program Counter
+  val systolic_btb_taken_out = Bool()     // Leader's BTB prediction (1=taken)
 }
 
 class SystolicInterface(implicit p: Parameters) extends Module {
@@ -76,6 +78,14 @@ class SystolicInterface(implicit p: Parameters) extends Module {
     val stall_out       = Output(Bool())
     val core_replay_out = Input(Bool())
     val replay_out      = Output(Bool())
+    val core_btb_taken_out = Input(Bool()) // Leader btb_taken from core
+    val btb_taken_out   = Output(Bool())   // Leader btb_taken to mesh
+
+    // Systolic ALU-to-ALU Auto-Forward (from core)
+    val core_east_auto_data  = Input(UInt(64.W))
+    val core_east_auto_wen   = Input(Bool())
+    val core_south_auto_data = Input(UInt(64.W))
+    val core_south_auto_wen  = Input(Bool())
   })
 
   // ------------------------------------------------------------------------
@@ -96,7 +106,9 @@ class SystolicInterface(implicit p: Parameters) extends Module {
   val reg_south = RegInit(0.U(64.W))
 
   when (io.core_east_wen)  { reg_east  := io.core_east_data }
+  .elsewhen (io.core_east_auto_wen) { reg_east := io.core_east_auto_data }
   when (io.core_south_wen) { reg_south := io.core_south_data }
+  .elsewhen (io.core_south_auto_wen) { reg_south := io.core_south_auto_data }
 
   // Drive outputs to neighbors
   io.east_out  := reg_east
@@ -118,4 +130,5 @@ class SystolicInterface(implicit p: Parameters) extends Module {
   // Global Stall & Replay Backpressure (combinational passthrough)
   io.stall_out := io.core_stall_out
   io.replay_out := io.core_replay_out
+  io.btb_taken_out := io.core_btb_taken_out
 }
