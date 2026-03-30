@@ -318,6 +318,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ex_reg_systolic_fp_mul  = RegInit(false.B)
   val ex_reg_systolic_fp_mac  = RegInit(false.B)
   val ex_reg_systolic_opA     = RegInit(0.U(xLen.W))
+  val ex_reg_systolic_opB     = RegInit(0.U(xLen.W))
   val ex_reg_wphit            = RegInit(0.U.asTypeOf(Vec(nBreakpoints, Bool())))
   val ex_reg_set_vconfig      = RegInit(false.B)
 
@@ -421,19 +422,23 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_ctrl = Wire(new IntCtrlSigs).decode(id_effective_inst, decode_table)
 
   // Detect SYSTOLIC_MUL: opcode=1011011 (CUSTOM2), funct3=000, funct7=0000000
-  val id_systolic_mul = id_effective_inst(6,0) === "b1011011".U &&
+  // Gated by legal decode and absence of decode-stage exceptions (e.g. pf.inst)
+  def id_systolic_mul = id_effective_inst(6,0) === "b1011011".U &&
                         id_effective_inst(14,12) === 0.U &&
-                        id_effective_inst(31,25) === 0.U
+                        id_effective_inst(31,25) === 0.U &&
+                        id_ctrl.legal && !id_xcpt
 
   // Detect SYSTOLIC_FMUL_S: opcode=1011011 (CUSTOM2), funct3=000, funct7=0000100
-  val id_systolic_fmul_s = id_effective_inst(6,0) === "b1011011".U &&
+  def id_systolic_fmul_s = id_effective_inst(6,0) === "b1011011".U &&
                            id_effective_inst(14,12) === 0.U &&
-                           id_effective_inst(31,25) === "b0000100".U
+                           id_effective_inst(31,25) === "b0000100".U &&
+                           id_ctrl.legal && !id_xcpt
 
   // Detect SYSTOLIC_FMAC_S: opcode=1011011 (CUSTOM2), funct3=000, funct7=0001000
-  val id_systolic_fmac_s = id_effective_inst(6,0) === "b1011011".U &&
+  def id_systolic_fmac_s = id_effective_inst(6,0) === "b1011011".U &&
                            id_effective_inst(14,12) === 0.U &&
-                           id_effective_inst(31,25) === "b0001000".U
+                           id_effective_inst(31,25) === "b0001000".U &&
+                           id_ctrl.legal && !id_xcpt
 
   // [SIMD Sync] Deferred startup bubble: on the rising edge of systolic_enable,
   // set a pending flag. When the first valid instruction arrives in ID after the
@@ -804,8 +809,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     ex_reg_systolic_mul := id_systolic_mul
     ex_reg_systolic_fp_mul := id_systolic_fmul_s
     ex_reg_systolic_fp_mac := id_systolic_fmac_s
-    // [Systolic ALU] Capture mesh_west at EX entry so MulDiv operand is stable
+    // [Systolic ALU/FPU] Capture mesh_west and mesh_north at EX entry so operands are stable and phase-aligned
     ex_reg_systolic_opA := io.systolic_opA
+    ex_reg_systolic_opB := io.systolic_opB
     ex_reg_wphit := bpu.io.bpwatch.map { bpw => bpw.ivalid(0) }
     ex_reg_set_vconfig := id_set_vconfig && !id_xcpt
 
@@ -1434,9 +1440,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.fpu.ll_resp_tag := dmem_resp_waddr
   io.fpu.keep_clock_enabled := io.ptw.customCSRs.disableCoreClockGate
 
-  // [Systolic FP] Drive FPU mesh data ports
+  // [Systolic FP] Drive FPU mesh data ports with latched operands
   io.fpu.systolic_opA    := ex_reg_systolic_opA
-  io.fpu.systolic_opB    := io.systolic_opB
+  io.fpu.systolic_opB    := ex_reg_systolic_opB
   io.fpu.systolic_fp_mul := ex_reg_systolic_fp_mul
   io.fpu.systolic_fp_mac := ex_reg_systolic_fp_mac
 
