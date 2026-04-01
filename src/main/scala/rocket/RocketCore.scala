@@ -191,6 +191,8 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val systolic_south_data_wen = Output(Bool())       // South write-enable
     val systolic_btb_taken_out = Output(Bool())        // Leader BTB prediction
     val systolic_btb_taken_in  = Input(Bool())         // Leader BTB prediction broadcast
+    val systolic_flush_out     = Output(Bool())        // Leader pipeline flush
+    val systolic_flush_in      = Input(Bool())         // Flush broadcast from leader
 
     // Systolic ALU-to-ALU Auto-Forward
     val systolic_east_auto_data  = Output(UInt(xLen.W))  // Pass-through mesh_west → east
@@ -318,7 +320,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ex_reg_systolic_fp_mul  = RegInit(false.B)
   val ex_reg_systolic_fp_mac  = RegInit(false.B)
   val ex_reg_systolic_opA     = RegInit(0.U(xLen.W))
-  val ex_reg_systolic_opB     = RegInit(0.U(xLen.W))
   val ex_reg_wphit            = RegInit(0.U.asTypeOf(Vec(nBreakpoints, Bool())))
   val ex_reg_set_vconfig      = RegInit(false.B)
 
@@ -422,23 +423,19 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_ctrl = Wire(new IntCtrlSigs).decode(id_effective_inst, decode_table)
 
   // Detect SYSTOLIC_MUL: opcode=1011011 (CUSTOM2), funct3=000, funct7=0000000
-  // Gated by legal decode and absence of decode-stage exceptions (e.g. pf.inst)
-  def id_systolic_mul = id_effective_inst(6,0) === "b1011011".U &&
+  val id_systolic_mul = id_effective_inst(6,0) === "b1011011".U &&
                         id_effective_inst(14,12) === 0.U &&
-                        id_effective_inst(31,25) === 0.U &&
-                        id_ctrl.legal && !id_xcpt
+                        id_effective_inst(31,25) === 0.U
 
   // Detect SYSTOLIC_FMUL_S: opcode=1011011 (CUSTOM2), funct3=000, funct7=0000100
-  def id_systolic_fmul_s = id_effective_inst(6,0) === "b1011011".U &&
+  val id_systolic_fmul_s = id_effective_inst(6,0) === "b1011011".U &&
                            id_effective_inst(14,12) === 0.U &&
-                           id_effective_inst(31,25) === "b0000100".U &&
-                           id_ctrl.legal && !id_xcpt
+                           id_effective_inst(31,25) === "b0000100".U
 
   // Detect SYSTOLIC_FMAC_S: opcode=1011011 (CUSTOM2), funct3=000, funct7=0001000
-  def id_systolic_fmac_s = id_effective_inst(6,0) === "b1011011".U &&
+  val id_systolic_fmac_s = id_effective_inst(6,0) === "b1011011".U &&
                            id_effective_inst(14,12) === 0.U &&
-                           id_effective_inst(31,25) === "b0001000".U &&
-                           id_ctrl.legal && !id_xcpt
+                           id_effective_inst(31,25) === "b0001000".U
 
   // [SIMD Sync] Deferred startup bubble: on the rising edge of systolic_enable,
   // set a pending flag. When the first valid instruction arrives in ID after the
@@ -809,9 +806,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     ex_reg_systolic_mul := id_systolic_mul
     ex_reg_systolic_fp_mul := id_systolic_fmul_s
     ex_reg_systolic_fp_mac := id_systolic_fmac_s
-    // [Systolic ALU/FPU] Capture mesh_west and mesh_north at EX entry so operands are stable and phase-aligned
+    // [Systolic ALU] Capture mesh_west at EX entry so MulDiv operand is stable
     ex_reg_systolic_opA := io.systolic_opA
-    ex_reg_systolic_opB := io.systolic_opB
     ex_reg_wphit := bpu.io.bpwatch.map { bpw => bpw.ivalid(0) }
     ex_reg_set_vconfig := id_set_vconfig && !id_xcpt
 
@@ -832,13 +828,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                              ex_ctrl.vec && !io.vector.map(_.ex.ready).getOrElse(true.B)
   val replay_ex_load_use = wb_dcache_miss && ex_reg_load_use
   val replay_ex = ex_reg_replay || (ex_reg_valid && (replay_ex_structural || replay_ex_load_use))
-  // [SIMD Loop] Slip-tolerant branch flush. Followers evaluate branches locally.
-  // We use the Leader's broadcasted BTB prediction (injected into ex_reg_btb_resp
-  // and passed to mem_reg_btb_resp) to natively determine if the branch mispredicted.
-  // Because pipeline slip can occur, the kill decision MUST be made locally
-  // using the Follower's own pipeline state and the Leader's prediction marker.
-  val follower_branch_kill = mem_reg_valid && mem_reg_systolic_follower && mem_ctrl.branch && mem_br_taken =/= (usingBTB.B && mem_reg_btb_resp.taken)
-  val ctrl_killx = take_pc_mem_wb || replay_ex || !ex_reg_valid || follower_branch_kill
+  
+  // [SIMD Loop] Leader broadcasts pipeline flush (take_pc_mem_wb) to synchronize followers
+  io.systolic_flush_out := take_pc_mem_wb
+  
+  val ctrl_killx = take_pc_mem_wb || replay_ex || !ex_reg_valid || (io.systolic_flush_in && id_systolic_follower)
   // detect 2-cycle load-use delay for LB/LH/SC
   val ex_slow_bypass = ex_ctrl.mem_cmd === M_XSC || ex_reg_mem_size < 2.U
   val ex_sfence = usingVM.B && ex_ctrl.mem && (ex_ctrl.mem_cmd === M_SFENCE || ex_ctrl.mem_cmd === M_HFENCEV || ex_ctrl.mem_cmd === M_HFENCEG)
@@ -1014,7 +1008,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // Successful followers do NOT replay — the stall OR-tree holds them until
   // the nacked core finishes its local retry. This breaks Perfect Symmetry:
   // only the nacked core(s) re-issue to D-cache, eliminating contention.
-  val replay_wb = local_replay_req || (global_replay_wb && is_leader)
+  val replay_wb = local_replay_req || global_replay_wb
   
   when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
     printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d leader=%d participating=%d nack=%d\n",
@@ -1339,7 +1333,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ctrl_stalld = ctrl_stalld_local || (io.systolic_stall && io.systolic_enable)
 
   // [Fix A] Mask perma-kill from frozen IBuf replay
-  ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
+  val systolic_flush_applied = io.systolic_flush_in && id_systolic_follower
+  ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt || systolic_flush_applied
 
   // Drive global stall backpressure from LOCAL conditions only (no loop)
   //
@@ -1440,9 +1435,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   io.fpu.ll_resp_tag := dmem_resp_waddr
   io.fpu.keep_clock_enabled := io.ptw.customCSRs.disableCoreClockGate
 
-  // [Systolic FP] Drive FPU mesh data ports with latched operands
+  // [Systolic FP] Drive FPU mesh data ports
   io.fpu.systolic_opA    := ex_reg_systolic_opA
-  io.fpu.systolic_opB    := ex_reg_systolic_opB
+  io.fpu.systolic_opB    := io.systolic_opB
   io.fpu.systolic_fp_mul := ex_reg_systolic_fp_mul
   io.fpu.systolic_fp_mac := ex_reg_systolic_fp_mac
 

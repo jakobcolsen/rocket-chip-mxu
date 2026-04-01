@@ -17,7 +17,7 @@
 
 #define MSTATUS_MIE  0x00000008
 #define NUM_CORES    4
-#define N            64          /* total elements */
+#define N            1024          /* total elements */
 #define SLICE        (N / NUM_CORES)  /* 16 per core */
 #define SCALAR_A     3
 

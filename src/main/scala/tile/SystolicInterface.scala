@@ -16,6 +16,7 @@ class SystolicInputBundle(implicit p: Parameters) extends Bundle {
   val instruction_valid = Bool()          // Leader is executing
   val pc               = UInt(64.W)       // Leader's Program Counter
   val systolic_btb_taken = Bool()         // Leader's BTB prediction (1=taken)
+  val systolic_flush   = Bool()           // Leader's pipeline flush broadcast
 }
 
 // Flows from Tile -> Mesh Network
@@ -30,6 +31,7 @@ class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
   val instruction_valid = Bool()          // Leader is executing
   val pc               = UInt(64.W)       // Leader's Program Counter
   val systolic_btb_taken_out = Bool()     // Leader's BTB prediction (1=taken)
+  val systolic_flush_out = Bool()         // Leader's pipeline flush broadcast
 }
 
 class SystolicInterface(implicit p: Parameters) extends Module {
@@ -80,6 +82,10 @@ class SystolicInterface(implicit p: Parameters) extends Module {
     val replay_out      = Output(Bool())
     val core_btb_taken_out = Input(Bool()) // Leader btb_taken from core
     val btb_taken_out   = Output(Bool())   // Leader btb_taken to mesh
+    val core_flush_out  = Input(Bool())
+    val flush_out       = Output(Bool())
+    val flush_in        = Input(Bool())
+    val core_flush_in   = Output(Bool())
 
     // Systolic ALU-to-ALU Auto-Forward (from core)
     val core_east_auto_data  = Input(UInt(64.W))
@@ -131,4 +137,6 @@ class SystolicInterface(implicit p: Parameters) extends Module {
   io.stall_out := io.core_stall_out
   io.replay_out := io.core_replay_out
   io.btb_taken_out := io.core_btb_taken_out
+  io.flush_out := io.core_flush_out
+  io.core_flush_in := io.flush_in
 }

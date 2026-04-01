@@ -71,15 +71,18 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
           // Instruction Broadcast: Source 0 (Tile 0) drives global instruction
           val global_instruction = sys_outputs(0).instruction
           val global_instruction_valid = sys_outputs(0).instruction_valid
+          val global_flush = sys_outputs(0).systolic_flush_out
           val global_pc = sys_outputs(0).pc
           if (r == 0 && c == 0) {
             curr_in.instruction := 0.U
             curr_in.instruction_valid := false.B
             curr_in.pc := 0.U
+            curr_in.systolic_flush := false.B
           } else {
             curr_in.instruction := global_instruction
             curr_in.instruction_valid := global_instruction_valid
             curr_in.pc := global_pc
+            curr_in.systolic_flush := global_flush
           }
 
           // Drive Enable using Global Mode
@@ -112,6 +115,7 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
         in.pc              := 0.U
         in.instruction := 0.U
         in.instruction_valid := false.B
+        in.systolic_flush := false.B
       }
     }
     } // End if (count > 0)

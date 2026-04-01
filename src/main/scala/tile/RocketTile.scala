@@ -176,6 +176,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       systolic_if.io.systolic_enable  := systolic_in_io.systolic_enable
       systolic_if.io.systolic_stall   := systolic_in_io.systolic_stall
       systolic_if.io.systolic_replay  := systolic_in_io.systolic_replay
+      systolic_if.io.flush_in         := systolic_in_io.systolic_flush
 
       // Outputs from Interface -> Mesh
       systolic_out_io.east_out        := systolic_if.io.east_out
@@ -183,6 +184,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       systolic_out_io.instruction     := systolic_if.io.instruction_out
       systolic_out_io.instruction_valid := systolic_if.io.instruction_valid_out
       systolic_out_io.pc              := systolic_if.io.pc_out
+      systolic_out_io.systolic_flush_out := systolic_if.io.flush_out
       
       // 2. Wire to Internal Core Pipeline
       core.io.systolic_opA          := systolic_if.io.alu_opA
@@ -192,6 +194,8 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_replay_in    := systolic_in_io.systolic_replay
       systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
       systolic_out_io.systolic_simd_mode   := core.io.systolic_simd_mode_out
+      systolic_if.io.core_flush_out        := core.io.systolic_flush_out
+      core.io.systolic_flush_in            := systolic_if.io.core_flush_in
       
       // Wire Instruction Broadcast Logic
       systolic_if.io.core_inst_out       := core.io.systolic_instruction_out
@@ -235,6 +239,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_instruction_valid_in := false.B
       core.io.systolic_pc_in := 0.U
       core.io.systolic_btb_taken_in := false.B
+      core.io.systolic_flush_in := false.B
   }
 
   outer.vector_unit.foreach { v =>

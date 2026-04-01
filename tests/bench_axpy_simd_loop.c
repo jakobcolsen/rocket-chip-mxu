@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include "systolic_mesh.h"
 
-#define N          64
+#define N          1024
 #define NUM_CORES   4
 #define SLICE      (N / NUM_CORES)   /* 16 elements per core */
 #define SCALAR_A    3
@@ -17,11 +17,20 @@ volatile int32_t Y[N] __attribute__((aligned(64)));
 
 void thread_entry(int cid, int nc) { /* no-op */ }
 
+void run_simd_axpy(void) {
+    uint64_t hartid = read_csr(mhartid);
+    int start = hartid * SLICE;
+    int end = start + SLICE;
+    for (int i = start; i < end; i++) {
+        Y[i] += SCALAR_A * X[i];
+    }
+}
+
 int main(void) {
     uint64_t hartid = read_csr(mhartid);
 
-    /* Disable interrupts */
-    clear_csr(mstatus, 0x8);
+    /* Disable interrupts to keep lockstep clean */
+    clear_csr(mstatus, 0x00000008); 
     write_csr(mie, 0);
 
     if (hartid == 0) {
@@ -38,41 +47,24 @@ int main(void) {
         uint64_t cyc_start = read_csr(mcycle);
 
         /* ── SIMD REGION ── */
-        asm volatile(
-            /* Activate SIMD */
-            "li   t2, 2                \n\t"
-            "csrw 0x800, t2            \n\t"
+        /* Activate SIMD */
+        asm volatile("csrw 0x800, 2");
 
-            /* Compute per-core slice base addresses */
-            "csrr t5, mhartid          \n\t"
-            "slli t5, t5, 6            \n\t"  /* hartid * 64 bytes */
-            "la   t0, X               \n\t"
-            "add  t0, t0, t5           \n\t"  /* t0 = &X[slice] */
-            "la   t1, Y               \n\t"
-            "add  t1, t1, t5           \n\t"  /* t1 = &Y[slice] */
-
-            /* Loop: 16 elements, 4 bytes each */
-            "li   t5, 64              \n\t"  /* t5 = 16 * 4 = byte limit */
-            "li   t2, 0               \n\t"  /* t2 = byte offset */
-        "1:                            \n\t"
-            "add  t3, t0, t2           \n\t"  /* &X[slice + i] */
-            "lw   t3, 0(t3)            \n\t"  /* t3 = X[i] */
-            "slli t4, t3, 1            \n\t"  /* t4 = 2*X[i] */
-            "add  t3, t4, t3           \n\t"  /* t3 = 3*X[i] */
-            "add  t4, t1, t2           \n\t"  /* &Y[slice + i] */
-            "lw   t4, 0(t4)            \n\t"  /* t4 = Y[i] */
-            "add  t3, t3, t4           \n\t"  /* t3 = 3*X[i] + Y[i] */
-            "add  t4, t1, t2           \n\t"  /* &Y[slice + i] */
-            "sw   t3, 0(t4)            \n\t"  /* Y[i] = result */
-            "addi t2, t2, 4            \n\t"  /* offset += 4 */
-            "bne  t2, t5, 1b           \n\t"  /* loop if offset < 64 */
-
-            "fence rw, rw              \n\t"
-            ::: "t0", "t1", "t2", "t3", "t4", "t5", "memory"
-        );
+        /* Cores branch and execute ABI-safe C loop together */
+        run_simd_axpy();
 
         /* Deactivate SIMD */
         asm volatile("csrw 0x800, x0");
+
+        /* Followers go to sleep immediately */
+        asm volatile(
+            "csrr t0, mhartid \n\t"
+            "beqz t0, 1f      \n\t"
+            "2: wfi           \n\t"
+            "j 2b             \n\t"
+            "1:               \n\t"
+            ::: "t0"
+        );
 
         uint64_t cyc_end = read_csr(mcycle);
         uint64_t elapsed = cyc_end - cyc_start;
@@ -97,7 +89,7 @@ int main(void) {
         if (passed) {
             printf("Verification PASSED — all %d elements correct.\n", N);
             printf("\n*** PASSED ***\n");
-            return 42;
+            return 0;
         } else {
             printf("Verification FAILED!\n");
             printf("*** FAILED ***\n");

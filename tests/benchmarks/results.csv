@@ -1,0 +1,2 @@
+benchmark,mode,N,cycles,instret,ipc,ops_per_cycle,pass
+gemm_csr,csr_systolic,4,1559,643,0.412,0.005,FAIL
