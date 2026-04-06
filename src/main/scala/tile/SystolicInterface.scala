@@ -17,6 +17,7 @@ class SystolicInputBundle(implicit p: Parameters) extends Bundle {
   val pc               = UInt(64.W)       // Leader's Program Counter
   val systolic_btb_taken = Bool()         // Leader's BTB prediction (1=taken)
   val systolic_flush   = Bool()           // Leader's pipeline flush broadcast
+  val simd_mem_token   = UInt(2.W)        // Token ring: which core may access D-cache
 }
 
 // Flows from Tile -> Mesh Network
@@ -32,6 +33,7 @@ class SystolicOutputBundle(implicit p: Parameters) extends Bundle {
   val pc               = UInt(64.W)       // Leader's Program Counter
   val systolic_btb_taken_out = Bool()     // Leader's BTB prediction (1=taken)
   val systolic_flush_out = Bool()         // Leader's pipeline flush broadcast
+  val simd_mem_active    = Bool()         // Core has in-flight D-cache operation
 }
 
 class SystolicInterface(implicit p: Parameters) extends Module {

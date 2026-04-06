@@ -1,20 +1,18 @@
 #!/bin/bash
-# run_benchmarks_firesim.sh — MXU Benchmark Suite on FireSim (Alveo U200)
+# run_benchmarks_firesim.sh — Run MXU Benchmarks via FireSim (Alveo U200 FPGA)
 #
-# Handles:
-#   1. XDMA driver check/reload
-#   2. Bitstream existence verification
-#   3. Workload JSON generation per benchmark
-#   4. FireSim infrasetup + runworkload
-#   5. Result parsing → results_firesim.csv
+# Compiles benchmarks, runs each through FireSim FPGA simulation,
+# parses cycle/instret counts from UART log, and writes results to results_firesim.csv.
 #
 # Usage:
-#   ./run_benchmarks_firesim.sh                  — run full suite
-#   ./run_benchmarks_firesim.sh axpy_simd_64     — run single benchmark
+#   ./run_benchmarks_firesim.sh                        — run full suite
+#   ./run_benchmarks_firesim.sh gemm_csr_256           — run single benchmark
+#   ./run_benchmarks_firesim.sh gemm_csr_256 gemm_mimd_256  — run specific benchmarks
 #
 # Prerequisites:
-#   - Benchmark .riscv files built (run 'make' in this directory first)
-#   - FPGA programmed with MXU bitstream (via firesim infrasetup or Vivado)
+#   - chipyard env sourced
+#   - FireSim bitstream built for FireSimQuadRocketMXUConfig
+#   - Custom XDMA driver built: ~/dma_ip_drivers/XDMA/linux-kernel/xdma/xdma.ko
 
 set -e
 
@@ -22,196 +20,49 @@ set -e
 CHIPYARD_DIR="/home/jolsen16/chipyard"
 FIRESIM_DIR="$CHIPYARD_DIR/sims/firesim"
 DEPLOY_DIR="$FIRESIM_DIR/deploy"
-WORKLOAD_DIR="$DEPLOY_DIR/workloads"
+WORKLOADS_DIR="$DEPLOY_DIR/workloads"
+RUNTIME_YAML="$DEPLOY_DIR/config_runtime.yaml"
+SIM_SLOT_DIR="/home/jolsen16/FIRESIM_RUNS_DIR/sim_slot_0"
+
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_CSV="$BENCH_DIR/results_firesim.csv"
-SIM_RUN_DIR="/home/jolsen16/FIRESIM_RUNS_DIR"
+POLL_INTERVAL=5     # seconds between completion checks
+MAX_WAIT=3600       # max seconds to wait per benchmark
 
-HW_CONFIG="alveo_u200_firesim_rocket_quadcore_mxu"
-WORKLOAD_JSON_NAME="mxu_bench.json"
-
-# XDMA driver locations (multiple versions)
-XDMA_DRIVER_DIRS=(
-    "/home/jolsen16/dma_ip_drivers/XDMA/linux-kernel/xdma"
-    "/home/jolsen16/dma_ip_drivers_6x/XDMA/linux-kernel/xdma"
-    "/home/jolsen16/dma_ip_drivers_xvsec/XDMA/linux-kernel/xdma"
-)
-
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║   MXU Benchmark Suite — FireSim (Alveo U200)        ║"
-echo "╚══════════════════════════════════════════════════════╝"
+echo "=== MXU FireSim Benchmark Suite ==="
+echo "FireSim:   $FIRESIM_DIR"
+echo "Results:   $RESULTS_CSV"
 echo ""
 
-# ── Step 0: Source FireSim environment ─────────────────────────────────
-echo "[0/5] Sourcing FireSim environment..."
-cd "$FIRESIM_DIR"
-source sourceme-manager.sh --skip-ssh-setup 2>/dev/null || {
-    echo "  Falling back to chipyard env..."
-    cd "$CHIPYARD_DIR"
-    source env.sh
-}
+# ── Build benchmarks ──────────────────────────────────────────────────
+echo "[1/4] Building benchmarks..."
 cd "$BENCH_DIR"
-echo "  ✓ Environment ready"
+make -j$(nproc) 2>&1 | tail -5
 echo ""
 
-# ── Step 1: XDMA Driver Check ─────────────────────────────────────────
-echo "[1/5] Checking XDMA driver..."
-
-xdma_loaded() {
-    lsmod 2>/dev/null | grep -q "^xdma" && return 0
-    ls /dev/xdma* 2>/dev/null | head -1 > /dev/null && return 0
-    return 1
-}
-
-xdma_reload() {
-    echo "  Attempting XDMA driver reload..."
-
-    # Try to unload first (ignore errors)
-    sudo rmmod xdma 2>/dev/null || true
-    sleep 1
-
-    # Find a working driver directory
-    for XDMA_DIR in "${XDMA_DRIVER_DIRS[@]}"; do
-        if [ -f "$XDMA_DIR/xdma.ko" ] || [ -f "$XDMA_DIR/Makefile" ]; then
-            echo "  Trying driver from: $XDMA_DIR"
-
-            # Build if needed
-            if [ ! -f "$XDMA_DIR/xdma.ko" ]; then
-                echo "  Building XDMA driver..."
-                (cd "$XDMA_DIR" && sudo make clean && sudo make) 2>&1 | tail -3
-            fi
-
-            # Load
-            if [ -f "$XDMA_DIR/xdma.ko" ]; then
-                sudo insmod "$XDMA_DIR/xdma.ko" 2>/dev/null && {
-                    sleep 2
-                    if xdma_loaded; then
-                        echo "  ✓ XDMA driver loaded from $XDMA_DIR"
-                        return 0
-                    fi
-                }
-            fi
-        fi
-    done
-
-    echo "  ✗ Could not load XDMA driver from any known location"
-    return 1
-}
-
-if xdma_loaded; then
-    echo "  ✓ XDMA driver already loaded"
-    # Show device nodes
-    XDMA_DEVS=$(ls /dev/xdma* 2>/dev/null | head -5)
-    [ -n "$XDMA_DEVS" ] && echo "  Devices: $(echo $XDMA_DEVS | tr '\n' ' ')"
-else
-    echo "  ✗ XDMA driver not loaded"
-    xdma_reload || {
-        echo ""
-        echo "ERROR: XDMA driver is required for FireSim on Alveo U200."
-        echo "Manual fix options:"
-        echo "  1. cd /home/jolsen16/dma_ip_drivers/XDMA/linux-kernel/xdma"
-        echo "  2. sudo make clean && sudo make"
-        echo "  3. sudo insmod xdma.ko"
-        echo ""
-        echo "If that fails, the FPGA may need to be re-programmed first."
-        exit 1
-    }
-fi
-echo ""
-
-# ── Step 2: Bitstream Check ───────────────────────────────────────────
-echo "[2/5] Checking bitstream..."
-
-# Check the hwdb entry for our config
-BITSTREAM_TAR=$(grep -A5 "^${HW_CONFIG}:" "$DEPLOY_DIR/config_hwdb.yaml" \
-    | grep "bitstream_tar:" | head -1 | sed 's/.*bitstream_tar: *//' | tr -d '"')
-
-if [ -z "$BITSTREAM_TAR" ] || [ "$BITSTREAM_TAR" = "null" ]; then
-    echo "  ✗ No bitstream_tar found for '$HW_CONFIG' in config_hwdb.yaml"
-    echo "  You need to build the bitstream first:"
-    echo "    cd $FIRESIM_DIR && firesim buildbitstream"
-    exit 1
-fi
-
-# Check if it's a local file
-if [[ "$BITSTREAM_TAR" == file://* ]]; then
-    LOCAL_PATH="${BITSTREAM_TAR#file://}"
-    if [ -f "$LOCAL_PATH" ]; then
-        echo "  ✓ Bitstream found: $(basename $LOCAL_PATH)"
-        echo "    $(du -h "$LOCAL_PATH" | cut -f1) at $LOCAL_PATH"
-    else
-        echo "  ✗ Bitstream file missing: $LOCAL_PATH"
-        echo "  Rebuild with: firesim buildbitstream"
-        exit 1
-    fi
-else
-    echo "  ℹ Bitstream is remote: $BITSTREAM_TAR"
-    echo "  (will be downloaded by firesim infrasetup)"
-fi
-
-# Check if FPGA is currently programmed (via xdma device presence)
-if xdma_loaded && ls /dev/xdma0_* 2>/dev/null | head -1 > /dev/null; then
-    echo "  ✓ FPGA appears programmed (xdma0 devices present)"
-else
-    echo "  ⚠ FPGA may not be programmed — firesim infrasetup will handle this"
-fi
-echo ""
-
-# ── Step 3: Verify runtime config ─────────────────────────────────────
-echo "[3/5] Verifying runtime configuration..."
-
-CURRENT_HW=$(grep "default_hw_config:" "$DEPLOY_DIR/config_runtime.yaml" \
-    | awk '{print $2}')
-if [ "$CURRENT_HW" != "$HW_CONFIG" ]; then
-    echo "  ⚠ config_runtime.yaml has hw_config='$CURRENT_HW'"
-    echo "    Expected: '$HW_CONFIG'"
-    echo "    Updating..."
-    sed -i "s/default_hw_config: .*/default_hw_config: $HW_CONFIG/" \
-        "$DEPLOY_DIR/config_runtime.yaml"
-    echo "  ✓ Updated"
-else
-    echo "  ✓ Hardware config: $HW_CONFIG"
-fi
-
-# Verify platform
-PLATFORM=$(grep "default_platform:" "$DEPLOY_DIR/config_runtime.yaml" | awk '{print $2}')
-echo "  ✓ Platform: $PLATFORM"
-echo "  ✓ Sim dir: $SIM_RUN_DIR"
-echo ""
-
-# ── Step 4: Build benchmarks if needed ─────────────────────────────────
-echo "[4/5] Checking benchmark binaries..."
-cd "$BENCH_DIR"
-
-RISCV_COUNT=$(ls *.riscv 2>/dev/null | wc -l)
-if [ "$RISCV_COUNT" -eq 0 ]; then
-    echo "  Building benchmarks..."
-    make -j$(nproc) 2>&1 | tail -3
-    RISCV_COUNT=$(ls *.riscv 2>/dev/null | wc -l)
-fi
-echo "  ✓ $RISCV_COUNT benchmark binaries available"
-echo ""
-
-# ── Step 5: Run benchmarks ─────────────────────────────────────────────
-echo "[5/5] Running benchmarks via FireSim..."
-
-# Determine which benchmarks to run
-if [ -n "$1" ]; then
-    TARGETS="$1.riscv"
-else
-    TARGETS=$(ls *.riscv 2>/dev/null | sort)
-fi
-
-TOTAL=$(echo "$TARGETS" | wc -w)
-echo "  Running $TOTAL benchmark(s)..."
-echo ""
-
-# Initialize CSV
+# ── Initialize CSV ─────────────────────────────────────────────────────
 echo "benchmark,mode,N,cycles,instret,ipc,ops_per_cycle,pass" > "$RESULTS_CSV"
 
-# Helper functions (same as Verilator version)
+# ── Helpers ────────────────────────────────────────────────────────────
+extract_metric() {
+    local output="$1"
+    local tag="$2"
+    echo "$output" | grep "^${tag}:" | tail -1 | awk '{print $2}'
+}
+
+ops_per_elem() {
+    local bench="$1"
+    case "$bench" in
+        axpy_*)  echo 2 ;;
+        dot_*)   echo 2 ;;
+        gemm_*)  echo 2 ;;
+        *)       echo 1 ;;
+    esac
+}
+
 bench_mode() {
-    case "$1" in
+    local bench="$1"
+    case "$bench" in
         *_simd*)     echo "simd" ;;
         *_mimd*)     echo "mimd" ;;
         *_csr*)      echo "csr_systolic" ;;
@@ -220,83 +71,181 @@ bench_mode() {
     esac
 }
 
-ops_per_elem() {
-    case "$1" in
-        axpy_*|dot_*) echo 2 ;;
-        gemm_*)       echo 2 ;;
-        *)            echo 1 ;;
-    esac
-}
-
-COUNT=0
-PASSED=0
-FAILED=0
-
-for BINARY in $TARGETS; do
-    COUNT=$((COUNT + 1))
-    BENCH_NAME="${BINARY%.riscv}"
-    BASE_NAME=$(echo "$BENCH_NAME" | sed 's/_[0-9]*$//')
-    SIZE=$(echo "$BENCH_NAME" | grep -o '[0-9]*$')
-    MODE=$(bench_mode "$BASE_NAME")
-
-    printf "  [%d/%d] %-30s " "$COUNT" "$TOTAL" "$BENCH_NAME"
-
-    # Create workload JSON for this benchmark
-    BINARY_ABS="$BENCH_DIR/$BINARY"
-    cat > "$WORKLOAD_DIR/$WORKLOAD_JSON_NAME" <<EOF
+# Create a FireSim workload JSON for a given binary
+create_workload() {
+    local bench_name="$1"
+    local binary_path="$2"
+    local wl_dir="$WORKLOADS_DIR/$bench_name"
+    
+    mkdir -p "$wl_dir"
+    
+    # Symlink binary into workload directory
+    ln -sf "$binary_path" "$wl_dir/${bench_name}.riscv"
+    
+    # Create workload JSON
+    cat > "$WORKLOADS_DIR/${bench_name}.json" <<EOF
 {
-    "benchmark_name": "mxu_bench_${BENCH_NAME}",
-    "common_simulation_outputs": ["uartlog"],
-    "common_bootbinary": "$BINARY_ABS",
+    "benchmark_name": "$bench_name",
+    "common_simulation_outputs": [
+        "uartlog"
+    ],
+    "common_bootbinary": "${bench_name}.riscv",
     "common_rootfs": null
 }
 EOF
+}
 
-    # Update config_runtime.yaml to use our workload
-    sed -i "s/workload_name: .*/workload_name: $WORKLOAD_JSON_NAME/" \
-        "$DEPLOY_DIR/config_runtime.yaml"
+# Update config_runtime.yaml workload_name
+set_workload() {
+    local wl_name="$1"
+    sed -i "s/workload_name: .*/workload_name: ${wl_name}.json/" "$RUNTIME_YAML"
+}
 
-    # Run firesim infrasetup + runworkload
-    cd "$DEPLOY_DIR"
-    firesim infrasetup > /tmp/firesim_infrasetup_$$.log 2>&1 || {
-        printf "INFRA_ERR\n"
-        echo "    infrasetup failed — check /tmp/firesim_infrasetup_$$.log"
-        FAILED=$((FAILED + 1))
-        echo "$BASE_NAME,$MODE,$SIZE,N/A,N/A,0,0,INFRA_ERR" >> "$RESULTS_CSV"
-        cd "$BENCH_DIR"
-        continue
-    }
+# Source FireSim environment once and export the function
+FIRESIM_ENV_SCRIPT="$FIRESIM_DIR/sourceme-manager.sh"
 
-    firesim runworkload > /tmp/firesim_runworkload_$$.log 2>&1 || true
-    cd "$BENCH_DIR"
-
-    # Find the most recent uartlog
-    LATEST_RUN=$(ls -td "$SIM_RUN_DIR"/mxu_bench_${BENCH_NAME}*/ 2>/dev/null | head -1)
-    UARTLOG=""
-    if [ -n "$LATEST_RUN" ]; then
-        UARTLOG=$(find "$LATEST_RUN" -name "uartlog" -type f 2>/dev/null | head -1)
+# Run firesim infrasetup (only needs to happen once per session)
+run_infrasetup() {
+    echo -n "    infrasetup..."
+    bash -c "
+        cd $FIRESIM_DIR
+        source sourceme-manager.sh --skip-ssh-setup 2>/dev/null
+        firesim infrasetup
+    " > /tmp/firesim_infrasetup.log 2>&1
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo " FAILED (exit code $rc)"
+        echo "    Check /tmp/firesim_infrasetup.log"
+        tail -5 /tmp/firesim_infrasetup.log | sed 's/^/    /'
+        return 1
     fi
+    echo " done"
+    return 0
+}
 
-    # Parse results from uartlog
-    CYCLES=""
-    INSTRET=""
-    PASS="FAIL"
+# Run FireSim runworkload synchronously (blocks until simulation completes)
+run_firesim_benchmark() {
+    local bench_name="$1"
+    local need_infrasetup="$2"  # "yes" or "no"
 
-    if [ -n "$UARTLOG" ] && [ -f "$UARTLOG" ]; then
-        CYCLES=$(grep "^CYCLES:" "$UARTLOG" 2>/dev/null | tail -1 | awk '{print $2}')
-        INSTRET=$(grep "^INSTRET:" "$UARTLOG" 2>/dev/null | tail -1 | awk '{print $2}')
-
-        if grep -q '\*\*\* PASSED \*\*\*' "$UARTLOG" 2>/dev/null; then
-            PASS="PASS"
-            PASSED=$((PASSED + 1))
-        else
-            FAILED=$((FAILED + 1))
+    if [ "$need_infrasetup" = "yes" ]; then
+        if ! run_infrasetup; then
+            return 1
         fi
-    else
-        echo "    ⚠ No uartlog found"
-        FAILED=$((FAILED + 1))
     fi
 
+    echo -n "    simulating..."
+    # Run synchronously — firesim runworkload blocks until the sim finishes
+    bash -c "
+        cd $FIRESIM_DIR
+        source sourceme-manager.sh --skip-ssh-setup 2>/dev/null
+        firesim runworkload
+    " > /tmp/firesim_run_${bench_name}.log 2>&1
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo " FAILED (exit code $rc)"
+        echo "    Check /tmp/firesim_run_${bench_name}.log"
+        tail -5 /tmp/firesim_run_${bench_name}.log | sed 's/^/    /'
+        return 1
+    fi
+    echo " done"
+    return 0
+}
+
+# Find the latest results directory for a benchmark
+find_results_dir() {
+    local bench_name="$1"
+    ls -1dt "$DEPLOY_DIR/results-workload/"*"-${bench_name}/" 2>/dev/null | head -1
+}
+
+# ── Determine which benchmarks to run ──────────────────────────────────
+if [ $# -gt 0 ]; then
+    BENCH_LIST="$@"
+else
+    # Default: all compiled .riscv binaries
+    BENCH_LIST=""
+    for f in "$BENCH_DIR"/*.riscv; do
+        [ -f "$f" ] || continue
+        bn=$(basename "$f" .riscv)
+        BENCH_LIST="$BENCH_LIST $bn"
+    done
+fi
+
+TOTAL=$(echo $BENCH_LIST | wc -w)
+echo "[2/4] Running $TOTAL benchmarks on FireSim FPGA..."
+echo ""
+
+# ── Run each benchmark ─────────────────────────────────────────────────
+COUNT=0
+PASSED=0
+FAILED_COUNT=0
+
+for BENCH_NAME in $BENCH_LIST; do
+    COUNT=$((COUNT + 1))
+    BINARY="${BENCH_NAME}.riscv"
+    BINARY_PATH="$BENCH_DIR/$BINARY"
+    
+    # Extract base name and size
+    BASE_NAME=$(echo "$BENCH_NAME" | sed 's/_[0-9]*$//')
+    SIZE=$(echo "$BENCH_NAME" | grep -o '[0-9]*$')
+    MODE=$(bench_mode "$BASE_NAME")
+    
+    printf "  [%d/%d] %-30s\n" "$COUNT" "$TOTAL" "$BENCH_NAME"
+    
+    if [ ! -f "$BINARY_PATH" ]; then
+        echo "    ERROR: Binary not found: $BINARY_PATH"
+        echo "$BASE_NAME,$MODE,$SIZE,N/A,N/A,0,0,MISSING" >> "$RESULTS_CSV"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        continue
+    fi
+    
+    # Create workload
+    create_workload "$BENCH_NAME" "$BINARY_PATH"
+    
+    # Set this workload as active
+    set_workload "$BENCH_NAME"
+    
+    # Run FireSim (infrasetup only needed for the first benchmark)
+    if [ $COUNT -eq 1 ]; then
+        NEED_SETUP="yes"
+    else
+        NEED_SETUP="yes"  # always re-setup since workload changed
+    fi
+    if ! run_firesim_benchmark "$BENCH_NAME" "$NEED_SETUP"; then
+        echo "$BASE_NAME,$MODE,$SIZE,N/A,N/A,0,0,FAIL" >> "$RESULTS_CSV"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        continue
+    fi
+    
+    # Find results and parse uartlog
+    RESULTS_DIR=$(find_results_dir "$BENCH_NAME")
+    UARTLOG=""
+    if [ -n "$RESULTS_DIR" ]; then
+        UARTLOG=$(find "$RESULTS_DIR" -name "uartlog" 2>/dev/null | head -1)
+    fi
+    # Fallback: check sim_slot_0 uartlog
+    if [ -z "$UARTLOG" ] || [ ! -s "$UARTLOG" ]; then
+        UARTLOG="$SIM_SLOT_DIR/uartlog"
+    fi
+    
+    if [ -f "$UARTLOG" ]; then
+        UART_OUTPUT=$(cat "$UARTLOG")
+    else
+        UART_OUTPUT=""
+    fi
+    
+    # Parse results
+    CYCLES=$(extract_metric "$UART_OUTPUT" "CYCLES")
+    INSTRET=$(extract_metric "$UART_OUTPUT" "INSTRET")
+    
+    if echo "$UART_OUTPUT" | grep -q '\*\*\* PASSED \*\*\*'; then
+        PASS="PASS"
+        PASSED=$((PASSED + 1))
+    else
+        PASS="FAIL"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+    fi
+    
     # Compute derived metrics
     IPC="0"
     OPS_PER_CYCLE="0"
@@ -309,34 +258,53 @@ EOF
             OPS_PER_CYCLE=$(awk "BEGIN {printf \"%.3f\", ($SIZE * $OPE) / $CYCLES}")
         fi
     fi
-
+    
     [ -z "$CYCLES" ]  && CYCLES="N/A"
     [ -z "$INSTRET" ] && INSTRET="N/A"
-
-    printf "%-6s  %s cycles  IPC=%s\n" "$PASS" "$CYCLES" "$IPC"
-
+    
+    printf "    %-6s  %s cycles  IPC=%s\n" "$PASS" "$CYCLES" "$IPC"
+    
     echo "$BASE_NAME,$MODE,$SIZE,$CYCLES,$INSTRET,$IPC,$OPS_PER_CYCLE,$PASS" >> "$RESULTS_CSV"
 done
 
 echo ""
 
-# ── Restore original workload config ──────────────────────────────────
-sed -i "s/workload_name: .*/workload_name: systolic.json/" \
-    "$DEPLOY_DIR/config_runtime.yaml"
+# ── Restore original workload ──────────────────────────────────────────
+set_workload "systolic"
 
 # ── Summary ────────────────────────────────────────────────────────────
-echo "═══════════════════════════════════════════════════════"
-echo "  Summary:  $PASSED passed, $FAILED failed (of $COUNT)"
-echo "  Results:  $RESULTS_CSV"
-echo "═══════════════════════════════════════════════════════"
+echo "[3/4] Summary"
+echo "  Total:  $COUNT"
+echo "  Passed: $PASSED"
+echo "  Failed: $FAILED_COUNT"
+echo ""
+echo "Results written to: $RESULTS_CSV"
 echo ""
 
 # Print results table
-echo "┌──────────────────────────────┬──────────────┬───────┬─────────┬─────────┬───────┐"
-printf "│ %-28s │ %-12s │ %5s │ %7s │ %7s │ %-5s │\n" "Benchmark" "Mode" "N" "Cycles" "IPC" "Pass"
-echo "├──────────────────────────────┼──────────────┼───────┼─────────┼─────────┼───────┤"
+echo "[4/4] Results"
+echo "┌──────────────────────────────┬──────────────┬───────┬─────────────┬─────────┬───────┐"
+printf "│ %-28s │ %-12s │ %5s │ %11s │ %7s │ %-5s │\n" "Benchmark" "Mode" "N" "Cycles" "IPC" "Pass"
+echo "├──────────────────────────────┼──────────────┼───────┼─────────────┼─────────┼───────┤"
 tail -n +2 "$RESULTS_CSV" | while IFS=, read -r bench mode n cycles instret ipc opc pass; do
-    printf "│ %-28s │ %-12s │ %5s │ %7s │ %7s │ %-5s │\n" "$bench" "$mode" "$n" "$cycles" "$ipc" "$pass"
+    printf "│ %-28s │ %-12s │ %5s │ %11s │ %7s │ %-5s │\n" "$bench" "$mode" "$n" "$cycles" "$ipc" "$pass"
 done
-echo "└──────────────────────────────┴──────────────┴───────┴─────────┴─────────┴───────┘"
+echo "└──────────────────────────────┴──────────────┴───────┴─────────────┴─────────┴───────┘"
+echo ""
+
+# ── Speedup comparison ─────────────────────────────────────────────────
+echo "Speedup Analysis (CSR vs MIMD for same size):"
+echo "─────────────────────────────────────────────"
+tail -n +2 "$RESULTS_CSV" | grep ",csr_systolic," | while IFS=, read -r cb cm cn cc ci cipc copc cp; do
+    MIMD_NAME=$(echo "$cb" | sed 's/_csr/_mimd/')
+    MIMD_LINE=$(grep "^$MIMD_NAME,mimd,$cn," "$RESULTS_CSV" 2>/dev/null | head -1)
+    if [ -n "$MIMD_LINE" ]; then
+        MC=$(echo "$MIMD_LINE" | cut -d, -f4)
+        if [ "$cc" != "N/A" ] && [ "$MC" != "N/A" ] && [ "$cc" -gt 0 ] 2>/dev/null; then
+            RATIO=$(awk "BEGIN {printf \"%.2f\", $cc / $MC}")
+            printf "  %-20s N=%-5s  MIMD=%s  CSR=%s  CSR/MIMD=%sx\n" \
+                   "$(echo $cb | sed 's/_csr//')" "$cn" "$MC" "$cc" "$RATIO"
+        fi
+    fi
+done
 echo ""

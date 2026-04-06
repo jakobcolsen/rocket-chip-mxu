@@ -60,6 +60,8 @@ int main(void) {
     bench_disable_interrupts();
 
     if (hartid == 0) {
+        printf("ALIVE: core 0 entry\n");
+
         /* Initialize matrices */
         for (int i = 0; i < DIM; i++) {
             for (int j = 0; j < DIM; j++) {
@@ -69,6 +71,8 @@ int main(void) {
                 C_ref[i * DIM + j] = 0.0f;
             }
         }
+
+        printf("ALIVE: init done\n");
 
         /* Compute reference */
         for (int i = 0; i < DIM; i++) {
@@ -82,12 +86,14 @@ int main(void) {
         }
         asm volatile ("fence rw, rw" ::: "memory");
 
+        printf("ALIVE: ref done\n");
         printf("BENCHMARK: gemm_csr\n");
         printf("N: %d\n", DIM);
 
         int rows_per_core = DIM / NUM_CORES;
         if (rows_per_core < 1) rows_per_core = DIM;
 
+        printf("ALIVE: starting compute (rows_per_core=%d)\n", rows_per_core);
         BENCH_START();
 
         if (DIM >= NUM_CORES) {
@@ -97,10 +103,13 @@ int main(void) {
 
         gemm_rows_csr(0, rows_per_core);
 
+        printf("ALIVE: core 0 compute done\n");
+
         if (DIM >= NUM_CORES) {
             mimd_barrier_wait(&done_cnt, NUM_CORES - 1);
         }
 
+        printf("ALIVE: barrier done\n");
         BENCH_END();
         BENCH_REPORT();
 

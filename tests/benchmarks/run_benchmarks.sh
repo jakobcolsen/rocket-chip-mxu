@@ -21,7 +21,7 @@ SIM_DIR="$CHIPYARD_DIR/sims/verilator"
 CONFIG="VerilatorQuadRocketMXUConfig"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_CSV="$BENCH_DIR/results.csv"
-TIMEOUT=1200 # seconds per simulation
+TIMEOUT=3600 # seconds per simulation
 
 # Find the simulator binary
 SIM_BIN=$(find "$SIM_DIR" -name "simulator-chipyard.harness-$CONFIG" -type f 2>/dev/null | head -1)

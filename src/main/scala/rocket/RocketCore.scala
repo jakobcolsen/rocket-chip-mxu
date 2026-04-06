@@ -200,6 +200,10 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val systolic_south_auto_data = Output(UInt(xLen.W))  // MUL result → south
     val systolic_south_auto_wen  = Output(Bool())
 
+    // SIMD Memory Token Ring
+    val simd_mem_token   = Input(UInt(2.W))   // Which core currently holds the D-cache token
+    val simd_mem_active  = Output(Bool())     // Core has in-flight D-cache operation
+
   })
 }
 
@@ -1182,8 +1186,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     lhs.wdata := rhs.wdata
     lhs.value := rhs.value
     rhs.stall := lhs.stall
-    // Do not wire PTW's set/sdata inputs; RocketCore will manually drive them later.
-    // If not driven later, they will default to false/0.
+    // Explicitly default set/sdata to prevent floating signals on FPGA.
+    // RocketCore may manually override these later via last-connect.
+    rhs.set := false.B
+    rhs.sdata := 0.U
   }
   io.ptw.status := csr.io.status
   io.ptw.hstatus := csr.io.hstatus
@@ -1334,7 +1340,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // [Fix A] Mask perma-kill from frozen IBuf replay
   val systolic_flush_applied = io.systolic_flush_in && id_systolic_follower
-  ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt || systolic_flush_applied
+  val id_instruction_logically_valid = id_effective_valid && !(ibuf.io.inst(0).bits.replay && !id_systolic_follower) && !take_pc_mem_wb && !csr.io.interrupt && !systolic_flush_applied
+  ctrl_killd := !id_instruction_logically_valid || ctrl_stalld
 
   // Drive global stall backpressure from LOCAL conditions only (no loop)
   //
@@ -1370,7 +1377,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   //   (a) Pipeline contains the done instruction (PC match) — replay in progress, OR
   //   (b) Pipeline is drained AND we're in an active replay round
   // For normal inter-instruction gaps (no replay), dcache_blocked propagates.
-  val follower_pipeline_active = ex_reg_valid || mem_reg_valid || wb_reg_valid
+  val follower_pipeline_active = id_effective_valid || ex_reg_valid || mem_reg_valid || wb_reg_valid
   io.systolic_stall_out := io.systolic_enable && Mux(is_leader,
     (ctrl_stalld_local && !simd_startup_bubble) || take_pc_mem_wb,
     (ctrl_stalld_local && follower_pipeline_active) || dcache_blocked
@@ -1471,7 +1478,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // avoid scoreboard deadlock. Only nacked cores (systolic_store_done=false) retry.
   val suppress_done_store = systolic_store_done && io.systolic_enable &&
     !isRead(ex_ctrl.mem_cmd) && ex_reg_pc === systolic_done_pc
+  // [Token Ring disabled — causes livelock with SIMD stall OR-tree]
+  // simd_mem_blocked kept as false to avoid removing interface signals
+  val simd_mem_blocked = false.B
   io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem && !suppress_done_store
+  // [Drain] Signal that this core has an ISSUED D-cache op in-flight.
+  // Only count MEM/WB stages — used by SystolicMesh drain logic.
+  io.simd_mem_active := (mem_reg_valid && mem_ctrl.mem) || (wb_ctrl.mem && wb_reg_valid)
   val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
   require(coreParams.dcacheReqTagBits >= ex_dcache_tag.getWidth)
   io.dmem.req.bits.tag  := ex_dcache_tag
@@ -1540,11 +1553,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       io.dmem.replay_next || // long-latency load replaying
       (!long_latency_stall && (ibuf.io.inst(0).valid || io.imem.resp.valid)) // instruction pending
 
-    io.systolic_stall_out := (dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
+    io.systolic_stall_out := io.systolic_enable && ((dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
       io.dmem.replay_next || // long-latency load replaying
       take_pc_wb || // pipeline flushes (eret, branch redirects)
       csr.io.interrupt       // async interrupts
-    ))
+    )))
 
     when (io.systolic_enable && (io.systolic_stall_out || io.systolic_stall)) {
       printf("C%d SYSTOLIC STALL pc=[%x] out=%d in=%d dcache_blk=%d local_req=%d\n",
@@ -1648,7 +1661,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     // Instruction Broadcast Export
     io.systolic_instruction_out := id_inst(0)
-    io.systolic_instruction_valid_out := is_leader && !ctrl_killd
+    io.systolic_instruction_valid_out := is_leader && id_instruction_logically_valid
 
     // [SIMD Loop] Broadcast leader's BTB prediction to followers
     io.systolic_btb_taken_out := is_leader && ibuf.io.btb_resp.taken

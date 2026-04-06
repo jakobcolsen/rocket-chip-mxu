@@ -1,22 +1,13 @@
 /*
- * gemm_systolic.c — Systolic GEMM via SYSTOLIC_FMUL_S
+ * gemm_systolic.c — Optimized Systolic GEMM via SYSTOLIC_FMUL_S
  *
  * C[N][N] += A[N][N] * B[N][N]   (single-precision floating-point)
  *
- * For each output element C[i][j]:
- *   MIMD: Leader pre-loads A-row and B-col into shared arrays
- *   SIMD: Single burst — k-loop reads from shared arrays,
- *         injects via CSR, FMUL, register accumulate, one store
- *   MIMD: Leader reads Hart 1's result
+ * Optimization v3: Zero-NOP pipelined approach.
+ * The Rocket FPU scoreboard should stall the readback instruction
+ * until the FMUL result is available, making explicit NOPs unnecessary.
  *
- * Optimizations vs previous version:
- *   - Register-based FP accumulation (no memory load/store per k)
- *   - Minimal NOPs (2 post-FMUL instead of 4+2)
- *   - No drain delay (removed for(d<100) loop)
- *   - SIMD_PARK_FOLLOWERS removed (hw wfi mask handles return)
- *
- * Note: FMAC (mesh_west * fs1 + mesh_north) accumulates spatially
- * across mesh rows, not temporally across k. We use FMUL + fadd.s.
+ * Additionally: 2×2 tile batching (4 dot products per SIMD burst).
  *
  * Compile: -DBENCH_N=<dim>
  */
@@ -34,11 +25,13 @@ volatile float B[DIM * DIM] __attribute__((aligned(64)));
 volatile float C[DIM * DIM] __attribute__((aligned(64)));
 volatile float C_ref[DIM * DIM] __attribute__((aligned(64)));
 
-/* Shared operands — leader pre-loads before SIMD enable */
-volatile uint32_t shared_a[DIM] __attribute__((aligned(64)));
-volatile uint32_t shared_b[DIM] __attribute__((aligned(64)));
+/* Shared operands for a 2×2 tile — 2 A-rows, 2 B-cols */
+volatile uint32_t shared_a0[DIM] __attribute__((aligned(64)));
+volatile uint32_t shared_a1[DIM] __attribute__((aligned(64)));
+volatile uint32_t shared_b0[DIM] __attribute__((aligned(64)));
+volatile uint32_t shared_b1[DIM] __attribute__((aligned(64)));
 
-/* Per-core result (cache-line padded per core) */
+/* Per-core results */
 volatile uint32_t tile_out[NUM_CORES * 16] __attribute__((aligned(64)));
 
 /* IEEE 754 helpers */
@@ -50,46 +43,76 @@ static inline float u2f(uint32_t u) {
 }
 
 /*
- * systolic_dot — one SIMD burst computing dot(A_row, B_col)
+ * systolic_tile_2x2 — one SIMD burst computing 4 dot products
  *
- * shared_a[] and shared_b[] pre-loaded by leader.
- * Accumulates in FP register, stores once at end.
+ * Zero-NOP: rely on FPU scoreboard to stall fmv.x.w until result ready.
  */
-static float __attribute__((noinline)) systolic_dot(void) {
+static void __attribute__((noinline)) systolic_tile_2x2(void) {
     asm volatile ("fence rw, rw" ::: "memory");
 
     SIMD_ENABLE();
 
-    /* k-loop: inject, FMUL, accumulate in register */
-    float acc = 0.0f;
+    float acc00 = 0.0f, acc01 = 0.0f, acc10 = 0.0f, acc11 = 0.0f;
+
+#pragma GCC unroll 16
     for (int k = 0; k < DIM; k++) {
-        uint32_t a_bits = shared_a[k];
-        uint32_t b_bits = shared_b[k];
+        uint32_t a0 = shared_a0[k];
+        uint32_t a1 = shared_a1[k];
+        uint32_t b0 = shared_b0[k];
+        uint32_t b1 = shared_b1[k];
+        uint32_t r;
 
-        write_csr(0x801, a_bits);
-
-        uint32_t res_bits;
+        /* DP 1: a0 * b0 — no NOPs, scoreboard handles hazard */
+        write_csr(0x801, a0);
         asm volatile (
-            "fmv.w.x ft0, %[bw]   \n\t"
+            "fmv.w.x ft0, %[bw]\n\t"
             SYSTOLIC_FMUL_S("ft1", "ft0")
-            "nop \n\t" "nop \n\t"
-            "fmv.x.w %[res], ft1   \n\t"
-            : [res] "=r" (res_bits)
-            : [bw] "r" (b_bits)
-            : "ft0", "ft1"
+            "fmv.x.w %[res], ft1\n\t"
+            : [res] "=r" (r) : [bw] "r" (b0) : "ft0", "ft1"
         );
+        acc00 += u2f(r);
 
-        acc += u2f(res_bits);
+        /* DP 2: a0 * b1 */
+        write_csr(0x801, a0);
+        asm volatile (
+            "fmv.w.x ft0, %[bw]\n\t"
+            SYSTOLIC_FMUL_S("ft1", "ft0")
+            "fmv.x.w %[res], ft1\n\t"
+            : [res] "=r" (r) : [bw] "r" (b1) : "ft0", "ft1"
+        );
+        acc01 += u2f(r);
+
+        /* DP 3: a1 * b0 */
+        write_csr(0x801, a1);
+        asm volatile (
+            "fmv.w.x ft0, %[bw]\n\t"
+            SYSTOLIC_FMUL_S("ft1", "ft0")
+            "fmv.x.w %[res], ft1\n\t"
+            : [res] "=r" (r) : [bw] "r" (b0) : "ft0", "ft1"
+        );
+        acc10 += u2f(r);
+
+        /* DP 4: a1 * b1 */
+        write_csr(0x801, a1);
+        asm volatile (
+            "fmv.w.x ft0, %[bw]\n\t"
+            SYSTOLIC_FMUL_S("ft1", "ft0")
+            "fmv.x.w %[res], ft1\n\t"
+            : [res] "=r" (r) : [bw] "r" (b1) : "ft0", "ft1"
+        );
+        acc11 += u2f(r);
     }
 
-    /* Store result per-core INSIDE the function (before SIMD disable) */
-    tile_out[read_csr(mhartid) * 16] = f2u(acc);
+    /* Store all 4 results per-core */
+    uint64_t hid = read_csr(mhartid);
+    tile_out[hid * 16 + 0] = f2u(acc00);
+    tile_out[hid * 16 + 1] = f2u(acc01);
+    tile_out[hid * 16 + 2] = f2u(acc10);
+    tile_out[hid * 16 + 3] = f2u(acc11);
 
     SIMD_DISABLE();
 
     asm volatile ("fence rw, rw" ::: "memory");
-
-    return u2f(tile_out[1 * 16]);
 }
 
 int main(void) {
@@ -124,15 +147,27 @@ int main(void) {
 
         BENCH_START();
 
-        for (int i = 0; i < DIM; i++) {
-            for (int j = 0; j < DIM; j++) {
-                /* Pre-load operands (MIMD, only leader runs this) */
+        /* Process in 2×2 output tiles */
+        for (int ti = 0; ti < DIM; ti += 2) {
+            for (int tj = 0; tj < DIM; tj += 2) {
+                /* Pre-load 2 A-rows and 2 B-columns */
                 for (int k = 0; k < DIM; k++) {
-                    shared_a[k] = f2u(A[i * DIM + k]);
-                    shared_b[k] = f2u(B[k * DIM + j]);
+                    shared_a0[k] = f2u(A[ti * DIM + k]);
+                    shared_a1[k] = (ti + 1 < DIM) ? f2u(A[(ti+1) * DIM + k]) : 0;
+                    shared_b0[k] = f2u(B[k * DIM + tj]);
+                    shared_b1[k] = (tj + 1 < DIM) ? f2u(B[k * DIM + (tj+1)]) : 0;
                 }
 
-                C[i * DIM + j] = systolic_dot();
+                systolic_tile_2x2();
+
+                /* Read Core 1's results */
+                C[ti * DIM + tj]         = u2f(tile_out[1 * 16 + 0]);
+                if (tj + 1 < DIM)
+                    C[ti * DIM + (tj+1)] = u2f(tile_out[1 * 16 + 1]);
+                if (ti + 1 < DIM)
+                    C[(ti+1) * DIM + tj] = u2f(tile_out[1 * 16 + 2]);
+                if (ti + 1 < DIM && tj + 1 < DIM)
+                    C[(ti+1) * DIM + (tj+1)] = u2f(tile_out[1 * 16 + 3]);
             }
         }
 
