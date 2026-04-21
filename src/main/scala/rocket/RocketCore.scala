@@ -1666,7 +1666,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     // Instruction Broadcast Export
     io.systolic_instruction_out := id_inst(0)
-    io.systolic_instruction_valid_out := is_leader && id_instruction_logically_valid
+    io.systolic_instruction_valid_out := is_leader && id_instruction_logically_valid && !simd_startup_bubble
 
     // [SIMD Loop] Broadcast leader's BTB prediction to followers
     io.systolic_btb_taken_out := is_leader && ibuf.io.btb_resp.taken
