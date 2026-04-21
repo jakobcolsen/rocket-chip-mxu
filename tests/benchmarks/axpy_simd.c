@@ -13,13 +13,15 @@
 #define SCALAR_A  3
 #define SLICE     (BENCH_N / NUM_CORES)
 
-/* Cache-line aligned arrays */
-volatile int32_t X[BENCH_N] __attribute__((aligned(64)));
-volatile int32_t Y[BENCH_N] __attribute__((aligned(64)));
+#define ALIAS_PAD 16 // 64 bytes of offset per core to prevent L2 set aliasing
+
+/* Cache-line aligned arrays, with extra room for the padding offsets */
+int32_t X[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
+volatile int32_t Y[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
 
 static void __attribute__((noinline)) simd_axpy_kernel(void) {
     uint64_t hartid = read_csr(mhartid);
-    int start = hartid * SLICE;
+    int start = hartid * SLICE + (hartid * ALIAS_PAD);
     int end   = start + SLICE;
     for (int i = start; i < end; i++) {
         Y[i] += SCALAR_A * X[i];
@@ -32,7 +34,7 @@ int main(void) {
 
     if (hartid == 0) {
         /* Initialize arrays */
-        for (int i = 0; i < BENCH_N; i++) {
+        for (int i = 0; i < BENCH_N + 4 * ALIAS_PAD; i++) {
             X[i] = i + 1;
             Y[i] = 100 + i;
         }
@@ -55,13 +57,17 @@ int main(void) {
 
         /* Verify */
         int passed = 1;
-        for (int i = 0; i < BENCH_N; i++) {
-            int32_t expected = SCALAR_A * (i + 1) + (100 + i);
-            if (Y[i] != expected) {
-                printf("  MISMATCH Y[%d] = %d, expected %d\n",
-                       i, (int)Y[i], (int)expected);
-                passed = 0;
-                if (i > 5) { printf("  ... (more errors)\n"); break; }
+        for (int c = 0; c < NUM_CORES; c++) {
+            int start = c * SLICE + (c * ALIAS_PAD);
+            int end   = start + SLICE;
+            for (int i = start; i < end; i++) {
+                int32_t expected = SCALAR_A * (i + 1) + (100 + i);
+                if (Y[i] != expected) {
+                    printf("  MISMATCH core %d Y[%d] = %d, expected %d\n",
+                           c, i, (int)Y[i], (int)expected);
+                    passed = 0;
+                    if (i > start + 5) { printf("  ... (more errors)\n"); break; }
+                }
             }
         }
 

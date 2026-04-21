@@ -192,6 +192,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_enable       := systolic_in_io.systolic_enable
       core.io.systolic_stall        := systolic_in_io.systolic_stall
       core.io.systolic_replay_in    := systolic_in_io.systolic_replay
+      core.io.simd_mem_token        := systolic_in_io.simd_mem_token
       systolic_out_io.systolic_master_ctrl := core.io.systolic_master_ctrl
       systolic_out_io.systolic_simd_mode   := core.io.systolic_simd_mode_out
       systolic_if.io.core_flush_out        := core.io.systolic_flush_out
@@ -221,6 +222,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       systolic_out_io.systolic_replay_out := systolic_if.io.replay_out
       systolic_if.io.core_btb_taken_out := core.io.systolic_btb_taken_out
       systolic_out_io.systolic_btb_taken_out := systolic_if.io.btb_taken_out
+      systolic_out_io.simd_mem_active := core.io.simd_mem_active
       core.io.systolic_btb_taken_in := systolic_in_io.systolic_btb_taken
 
       // 5. Wire Systolic ALU-to-ALU Auto-Forward
@@ -240,6 +242,7 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
       core.io.systolic_pc_in := 0.U
       core.io.systolic_btb_taken_in := false.B
       core.io.systolic_flush_in := false.B
+      core.io.simd_mem_token := 0.U
   }
 
   outer.vector_unit.foreach { v =>

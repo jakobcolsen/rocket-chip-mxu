@@ -1,12 +1,13 @@
 /*
- * gemm_mimd.c — MIMD Fork-Join GEMM Benchmark
+ * gemm_simd.c — SIMD Lockstep GEMM Benchmark
  *
  * C[M][N] += A[M][K] * B[K][N]   (single-precision floating-point)
  *
- * Standard parallel GEMM: each core computes a subset of output rows.
- * No mesh data paths are used — this is pure shared-memory MIMD.
+ * All 4 cores execute in hardware SIMD lockstep, each computing a
+ * disjoint slab of output rows using standard FP multiply-add (no
+ * systolic instructions).
  *
- * Row partitioning:
+ * Row partitioning (same as gemm_mimd):
  *   Core 0: rows [0, DIM/4)
  *   Core 1: rows [DIM/4, DIM/2)
  *   Core 2: rows [DIM/2, 3*DIM/4)
@@ -38,17 +39,45 @@ static inline uint32_t f2u(float f) {
     union { float f; uint32_t u; } x; x.f = f; return x.u;
 }
 
-/* Fork-join control */
-volatile int go       = 0;
-volatile int done_cnt = 0;
+/*
+ * SIMD GEMM kernel — called inside SIMD region.
+ *
+ * Each core reads mhartid to determine its own row slab.
+ * Store happens inside the j-loop body to satisfy BUG-001 workaround.
+ * Each core writes to its own disjoint row slab → no BUG-002 risk.
+ */
+static void __attribute__((noinline)) simd_gemm_kernel(void) {
+    uint64_t hartid = read_csr(mhartid);
+    int rows_per_core = DIM / NUM_CORES;
+    int row_start = 0;
+    int row_end = 0;
 
-static void __attribute__((noinline)) gemm_rows(int row_start, int row_end, int pad_offset) {
+    /* For small matrices: only core 0 computes.
+     * Followers deliberately bound the loop to [0, 0)
+     * avoiding the divergent `return` anomaly. */
+    if (rows_per_core < 1) {
+        if (hartid == 0) {
+            row_start = 0;
+            row_end = DIM;
+        }
+        rows_per_core = DIM;
+    } else {
+        row_start = hartid * rows_per_core;
+        row_end   = row_start + rows_per_core;
+        if (row_end > DIM) row_end = DIM;
+    }
+
+    int pad_offset = hartid * ALIAS_PAD;
+
     for (int i = row_start; i < row_end; i++) {
         for (int j = 0; j < DIM; j++) {
             float sum = 0.0f;
             for (int k = 0; k < DIM; k++) {
                 sum += A[i * DIM + k + pad_offset] * B[k * DIM + j];
             }
+            /* BUG-001 workaround: store inside loop body (j-loop),
+             * not after all loops complete. Each core writes to its
+             * own row slab, so no cache-line sharing (BUG-002 safe). */
             C[i * DIM + j + pad_offset] = sum;
         }
     }
@@ -90,36 +119,22 @@ int main(void) {
         }
         asm volatile ("fence rw, rw" ::: "memory");
 
-        printf("BENCHMARK: gemm_mimd\n");
+        printf("BENCHMARK: gemm_simd\n");
         printf("N: %d\n", DIM);
-
-        /* Determine row partitioning */
-        int rows_per_core = DIM / NUM_CORES;
-        if (rows_per_core < 1) rows_per_core = DIM;
 
         HPM_SETUP();
         BENCH_START();
         HPM_START();
 
-        /* Always wake followers for equitable workload spread */
-        if (DIM >= NUM_CORES) {
-            go = 1;
-            asm volatile ("fence rw, rw" ::: "memory");
-        }
-
-        /* Leader computes its rows */
-        int row_start = 0;
-        int row_end = rows_per_core;
-        if (row_end > DIM) row_end = DIM;
-        gemm_rows(row_start, row_end, 0);
-
-        /* Wait for followers */
-        if (DIM >= NUM_CORES) {
-            mimd_barrier_wait(&done_cnt, NUM_CORES - 1);
-        }
+        /* ── SIMD Region ── */
+        SIMD_ENABLE();
+        simd_gemm_kernel();
+        SIMD_DISABLE();
+        SIMD_PARK_FOLLOWERS();
 
         BENCH_END();
         HPM_END();
+        SIMD_DRAIN();
         BENCH_REPORT();
         HPM_REPORT();
 
@@ -140,8 +155,6 @@ int main(void) {
                     float exp = C_ref[i * DIM + j];
                     float diff = got - exp;
                     if (diff < 0) diff = -diff;
-                    printf("  C[%d][%d] = 0x%lx (exp 0x%lx)\n",
-                           i, j, (unsigned long)f2u(got), (unsigned long)f2u(exp));
                     if (diff > 0.01f) {
                         passed = 0;
                     }
@@ -156,25 +169,6 @@ int main(void) {
         }
 
     } else {
-        /* Follower: wait for go flag */
-        while (go == 0) { asm volatile ("nop"); }
-        asm volatile ("fence rw, rw" ::: "memory");
-
-        /* Compute my rows */
-        int rows_per_core = DIM / NUM_CORES;
-        if (rows_per_core < 1) {
-            /* Not enough rows — park immediately */
-        } else {
-            int row_start = hartid * rows_per_core;
-            int row_end   = row_start + rows_per_core;
-            if (row_end > DIM) row_end = DIM;
-            gemm_rows(row_start, row_end, hartid * ALIAS_PAD);
-        }
-
-        asm volatile ("fence rw, rw" ::: "memory");
-        __sync_fetch_and_add(&done_cnt, 1);
-
-        /* Park */
         while (1) { asm volatile ("wfi"); }
     }
 

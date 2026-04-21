@@ -85,8 +85,7 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
             curr_in.systolic_flush := global_flush
           }
 
-          // Drive Enable using Global Mode
-          curr_in.systolic_enable := global_simd_mode
+          // Drive Enable using effective_enable (defined below, after drain logic)
         }
       }
 
@@ -99,9 +98,37 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
       val global_stall = sys_outputs.map(_.systolic_stall_out).reduce(_ || _)
       val global_replay = sys_outputs.map(_.systolic_replay_out).reduce(_ || _)
 
+      // --- SIMD Pipeline Drain (BUG-001 fix) ---
+      // When the leader disables SIMD mode (csrw 0x800, 0), keep systolic_enable
+      // asserted until ALL cores have finished their in-flight D-cache operations.
+      // This prevents follower stores in EX/MEM from being killed prematurely.
+      val raw_simd_mode = sys_outputs(0).systolic_simd_mode
+      val all_mem_idle = !sys_outputs.map(_.simd_mem_active).reduce(_ || _)
+      
+      // To prevent a one-cycle glitch where effective_enable drops low before
+      // the drain register catches it, we define effective_enable combinatorially:
+      // It is high if raw_simd_mode is high, OR if it was high last cycle and
+      // memory operations are not yet idle.
+      val effective_enable = Wire(Bool())
+      val effective_enable_prev = RegNext(effective_enable, false.B)
+      effective_enable := raw_simd_mode || (effective_enable_prev && !all_mem_idle)
+
+      // --- SIMD Memory Token Ring (BUG-002 fix) ---
+      // A 2-bit counter that rotates when the current token holder has no
+      // in-flight D-cache operation. Only the core whose hartid matches
+      // the token may issue D-cache requests — this serializes memory
+      // access and prevents D-cache contention.
+      val mem_token = RegInit(0.U(2.W))
+      val current_holder_mem_active = VecInit(sys_outputs.map(_.simd_mem_active))(mem_token)
+      when (effective_enable && !global_stall && !current_holder_mem_active) {
+        mem_token := Mux(mem_token === (count - 1).U, 0.U, mem_token + 1.U)
+      }
+
       for (i <- 0 until count) {
+        sys_inputs(i).systolic_enable := effective_enable
         sys_inputs(i).systolic_stall := global_stall
         sys_inputs(i).systolic_replay := global_replay
+        sys_inputs(i).simd_mem_token := Mux(effective_enable, mem_token, i.U)
       }
 
     } else {
@@ -116,6 +143,7 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
         in.instruction := 0.U
         in.instruction_valid := false.B
         in.systolic_flush := false.B
+        in.simd_mem_token := 0.U
       }
     }
     } // End if (count > 0)

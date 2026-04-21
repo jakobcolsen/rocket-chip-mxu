@@ -47,6 +47,7 @@ _start:
     # This must happen before cores diverge to WFI for SIMD FP support
     li  t0, 0x6000       # FS field = bits [14:13]
     csrs mstatus, t0
+    fscsr x0, x0         # Initialize fcsr to 0 (RNE) to prevent illegal rounding mode traps
 
     # 5. Set up stack pointer (8KB per core)
     # Use 0x80100000 (1MB offset) to be safe within smaller DRAM configs

@@ -39,6 +39,11 @@ simd_*.log
 compilation_*.log
 main_dump.txt
 
+# Benchmark artifacts
+tests/benchmarks/*.tmp
+tests/benchmarks/*.out
+tests/benchmarks/run_log.txt
+
 # Misc
 simulator
 *.dis

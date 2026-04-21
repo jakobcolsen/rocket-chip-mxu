@@ -1,56 +1,92 @@
 /*
- * gemm_csr.c — MIMD GEMM with Row-Parallel CSR Result Forwarding
+ * gemm_csr.c — Systolic K-Split GEMM via CSR Mesh Reduction
  *
- * C[N][N] += A[N][N] * B[N][N]   (single-precision floating-point)
+ * C[M][N] += A[M][K] * B[K][N]   (single-precision floating-point)
  *
- * Each core independently computes its assigned output rows (same as
- * gemm_mimd). Additionally, west-column cores (0,2) forward their
- * computed C values to east-column cores (1,3) via CSR 0x801.
+ * True systolic data flow: the K reduction dimension is split across
+ * 4 cores. Each core computes a local partial sum for its K-slice,
+ * then partial sums cascade through the 2D mesh using BOTH axes:
  *
- * This demonstrates the CSR mesh data path for inter-core result
- * communication in a practical GEMM context.
+ *   Step 1 — East (CSR 0x801): accumulate across columns
+ *     Core 0 → Core 1:  Core 1 acc = partial_k0 + partial_k1
+ *     Core 2 → Core 3:  Core 3 acc = partial_k2 + partial_k3
  *
- * Row partitioning (same as gemm_mimd):
- *   Core 0: rows [0, DIM/4)       Core 1: rows [DIM/4, DIM/2)
- *   Core 2: rows [DIM/2, 3*DIM/4) Core 3: rows [3*DIM/4, DIM)
+ *   Step 2 — South (CSR 0x802): accumulate across rows
+ *     Core 1 → Core 3:  Core 3 final = (k0+k1) + (k2+k3) ✓
  *
- * For small matrices (DIM < 4), only core 0 computes.
+ * All cores store results to per-hartid sections of C.
+ * Core 3 (hartid = NUM_CORES-1) holds the fully-reduced output.
  *
- * Compile: -DBENCH_N=<dim>
+ * Compile: pass -DBENCH_N=<dim> for matrix dimension.
  */
 #include "common.h"
 
 #ifndef BENCH_N
+#undef BENCH_N
 #define BENCH_N 2
 #endif
 
 #define DIM BENCH_N
+#define ALIAS_PAD 16
 
-/* ── Matrices (row-major, FP32) ───────────────────────────────────── */
-volatile float A[DIM * DIM] __attribute__((aligned(64)));
-volatile float B[DIM * DIM] __attribute__((aligned(64)));
-volatile float C[DIM * DIM] __attribute__((aligned(64)));
-volatile float C_ref[DIM * DIM] __attribute__((aligned(64)));
+/* ── Matrices (row-major) ─────────────────────────────────────────── */
+float A[DIM * DIM] __attribute__((aligned(64)));
+float B[DIM * DIM] __attribute__((aligned(64)));
+/* Per-core output: each core stores to C[hartid * (DIM*DIM + ALIAS_PAD) + ...] */
+volatile float C[NUM_CORES * (DIM * DIM + ALIAS_PAD)] __attribute__((aligned(64)));
+float C_ref[DIM * DIM] __attribute__((aligned(64)));
 
-/* IEEE 754 helper */
+/* IEEE 754 helpers */
 static inline uint32_t f2u(float f) {
     union { float f; uint32_t u; } x; x.f = f; return x.u;
 }
+static inline float u2f(uint32_t u) {
+    union { float f; uint32_t u; } x; x.u = u; return x.f;
+}
 
-/* Fork-join control */
-volatile int go       = 0;
-volatile int done_cnt = 0;
+/*
+ * Systolic K-split reduction kernel.
+ *
+ * Each core handles DIM/NUM_CORES of the K dimension.
+ * After local partial sums, 2-step mesh reduction:
+ *   East accumulate → South accumulate → Core 3 has full dot product.
+ * ALL cores store to per-hartid C sections (avoids branch divergence).
+ */
+static void __attribute__((noinline)) systolic_reduction_kernel(void) {
+    uint64_t hartid = read_csr(mhartid);
 
-static void __attribute__((noinline)) gemm_rows_csr(int row_start, int row_end) {
-    for (int i = row_start; i < row_end; i++) {
+    /* K-split bounds for this core */
+    int k_per_core = (DIM + NUM_CORES - 1) / NUM_CORES;
+    int k_start = hartid * k_per_core;
+    int k_end   = k_start + k_per_core;
+    if (k_end > DIM) k_end = DIM;
+    if (k_start > DIM) k_start = DIM;
+
+    /* Per-core output base */
+    int c_base = hartid * (DIM * DIM + ALIAS_PAD);
+
+    for (int i = 0; i < DIM; i++) {
         for (int j = 0; j < DIM; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < DIM; k++) {
-                sum += A[i * DIM + k] * B[k * DIM + j];
+            /* ── Local partial sum for my K-slice ── */
+            float my_partial = 0.0f;
+            for (int k = k_start; k < k_end; k++) {
+                my_partial += A[i * DIM + k] * B[k * DIM + j];
             }
-            C[i * DIM + j] = sum;
-            /* Forward result to east neighbor via CSR */
-            write_csr(0x801, f2u(sum));
+
+            /* ── Step 1: Accumulate East (CSR 0x801) ──
+             * Core 0 → Core 1, Core 2 → Core 3 */
+            write_csr(0x801, f2u(my_partial));
+                        /* natural pipeline latency is sufficient — no NOPs needed */
+            float acc = my_partial + u2f(read_csr(0x801));
+
+            /* ── Step 2: Accumulate South (CSR 0x802) ──
+             * Core 1 → Core 3 */
+            write_csr(0x802, f2u(acc));
+                        /* natural pipeline latency is sufficient — no NOPs needed */
+            float result = acc + u2f(read_csr(0x802));
+
+            /* ALL cores store to their own section (no branch needed) */
+            C[c_base + i * DIM + j] = result;
         }
     }
 }
@@ -61,13 +97,13 @@ int main(void) {
 
     if (hartid == 0) {
         /* Initialize matrices */
-        for (int i = 0; i < DIM; i++) {
-            for (int j = 0; j < DIM; j++) {
-                A[i * DIM + j] = (float)(i * DIM + j + 1);
-                B[i * DIM + j] = (float)(i * DIM + j + 1) * 0.5f;
-                C[i * DIM + j] = 0.0f;
-                C_ref[i * DIM + j] = 0.0f;
-            }
+        for (int i = 0; i < DIM * DIM; i++) {
+            A[i] = (float)(i + 1);
+            B[i] = (float)(i + 1) * 0.5f;
+            C_ref[i] = 0.0f;
+        }
+        for (int i = 0; i < NUM_CORES * (DIM * DIM + ALIAS_PAD); i++) {
+            C[i] = 0.0f;
         }
 
         /* Compute reference */
@@ -85,59 +121,42 @@ int main(void) {
         printf("BENCHMARK: gemm_csr\n");
         printf("N: %d\n", DIM);
 
-        int rows_per_core = DIM / NUM_CORES;
-        if (rows_per_core < 1) rows_per_core = DIM;
-
+        HPM_SETUP();
         BENCH_START();
+        HPM_START();
 
-        if (DIM >= NUM_CORES) {
-            go = 1;
-            asm volatile ("fence rw, rw" ::: "memory");
-        }
-
-        gemm_rows_csr(0, rows_per_core);
-
-        if (DIM >= NUM_CORES) {
-            mimd_barrier_wait(&done_cnt, NUM_CORES - 1);
-        }
+        SIMD_ENABLE();
+        systolic_reduction_kernel();
+        asm volatile ("fence rw, rw" ::: "memory");
+        SIMD_DISABLE();
+        SIMD_PARK_FOLLOWERS();
 
         BENCH_END();
+        HPM_END();
+        SIMD_DRAIN();
+        asm volatile ("fence rw, rw" ::: "memory");
         BENCH_REPORT();
+        HPM_REPORT();
 
-        /* Verify */
+        /* Verify Core 3's output section (fully reduced) */
+        int core3_base = (NUM_CORES - 1) * (DIM * DIM + ALIAS_PAD);
         int passed = 1;
-        printf("Results:\n");
         for (int i = 0; i < DIM; i++) {
             for (int j = 0; j < DIM; j++) {
-                float got = C[i * DIM + j];
+                float got = C[core3_base + i * DIM + j];
                 float exp = C_ref[i * DIM + j];
                 float diff = got - exp;
                 if (diff < 0) diff = -diff;
-                printf("  C[%d][%d] = 0x%lx (exp 0x%lx)\n",
-                       i, j, (unsigned long)f2u(got), (unsigned long)f2u(exp));
-                if (diff > 0.01f) passed = 0;
+                if (diff > 0.01f && passed) {
+                    passed = 0;
+                    printf("  FAIL C[%d][%d]=%f exp=%f\n", i, j, got, exp);
+                }
             }
         }
-
         if (passed) printf("*** PASSED ***\n");
         else        printf("*** FAILED ***\n");
 
     } else {
-        while (go == 0) { asm volatile ("nop"); }
-        asm volatile ("fence rw, rw" ::: "memory");
-
-        int rows_per_core = DIM / NUM_CORES;
-        if (rows_per_core < 1) {
-            /* Not enough rows — park */
-        } else {
-            int row_start = hartid * rows_per_core;
-            int row_end   = row_start + rows_per_core;
-            if (row_end > DIM) row_end = DIM;
-            gemm_rows_csr(row_start, row_end);
-        }
-
-        asm volatile ("fence rw, rw" ::: "memory");
-        __sync_fetch_and_add(&done_cnt, 1);
         while (1) { asm volatile ("wfi"); }
     }
 

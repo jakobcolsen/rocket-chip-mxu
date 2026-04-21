@@ -16,12 +16,12 @@
 set -e
 
 # ── Configuration ──────────────────────────────────────────────────────
-CHIPYARD_DIR="/home/jolsen16/chipyard"
+CHIPYARD_DIR="${CHIPYARD:-$HOME/chipyard}"
 SIM_DIR="$CHIPYARD_DIR/sims/verilator"
 CONFIG="VerilatorQuadRocketMXUConfig"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_CSV="$BENCH_DIR/results.csv"
-TIMEOUT=1200 # seconds per simulation
+TIMEOUT=3600 # seconds per simulation
 
 # Find the simulator binary
 SIM_BIN=$(find "$SIM_DIR" -name "simulator-chipyard.harness-$CONFIG" -type f 2>/dev/null | head -1)
@@ -150,6 +150,28 @@ for BINARY in $TARGETS; do
 
     # Write to CSV
     echo "$BASE_NAME,$MODE,$SIZE,$CYCLES,$INSTRET,$IPC,$OPS_PER_CYCLE,$PASS" >> "$RESULTS_CSV"
+
+    # Secondary run on standard config if it's a MIMD benchmark
+    if [ "$MODE" = "mimd" ]; then
+        STANDARD_SIM_BIN=$(find "$SIM_DIR" -name "simulator-chipyard.harness-QuadRocketConfig" -type f 2>/dev/null | head -1)
+        if [ -n "$STANDARD_SIM_BIN" ]; then
+            printf "  [CONTROL] %-30s " "${BENCH_NAME} (StandardQuad)"
+            SIM_OUTPUT=$(timeout "$TIMEOUT" "$STANDARD_SIM_BIN" +permissive +loadmem="$BENCH_DIR/$BINARY" +permissive-off "$BENCH_DIR/$BINARY" </dev/null 2>&1) || true
+            CYCLES=$(extract_metric "$SIM_OUTPUT" "CYCLES")
+            INSTRET=$(extract_metric "$SIM_OUTPUT" "INSTRET")
+            if echo "$SIM_OUTPUT" | grep -q '\*\*\* PASSED \*\*\*'; then PASS="PASS"; PASSED=$((PASSED + 1)); else PASS="FAIL"; FAILED=$((FAILED + 1)); fi
+            IPC="0"; OPS_PER_CYCLE="0"
+            if [ -n "$CYCLES" ] && [ "$CYCLES" -gt 0 ] 2>/dev/null; then
+                if [ -n "$INSTRET" ] && [ "$INSTRET" -gt 0 ] 2>/dev/null; then IPC=$(awk "BEGIN {printf \"%.3f\", $INSTRET / $CYCLES}"); fi
+                OPE=$(ops_per_elem "$BASE_NAME")
+                if [ -n "$SIZE" ] && [ "$SIZE" -gt 0 ] 2>/dev/null; then OPS_PER_CYCLE=$(awk "BEGIN {printf \"%.3f\", ($SIZE * $OPE) / $CYCLES}"); fi
+            fi
+            [ -z "$CYCLES" ] && CYCLES="N/A"
+            [ -z "$INSTRET" ] && INSTRET="N/A"
+            printf "%-6s  %s cycles  IPC=%s\n" "$PASS" "$CYCLES" "$IPC"
+            echo "$BASE_NAME,${MODE}_standard,$SIZE,$CYCLES,$INSTRET,$IPC,$OPS_PER_CYCLE,$PASS" >> "$RESULTS_CSV"
+        fi
+    fi
 done
 
 echo ""

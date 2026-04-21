@@ -20,7 +20,15 @@ class WithSystolicEnabled extends Config((site, here, up) => {
 })
 
 class VerilatorQuadRocketMXUConfig extends Config(
+  new chipyard.config.WithNPerfCounters(6) ++
   new WithSystolicEnabled ++
+  new WithResetVectorToBootROM ++
+  new chipyard.config.WithNoTileClockGaters ++
+  new chipyard.QuadRocketConfig)
+
+// Vanilla Rocket (no MXU) for regression baseline
+class VerilatorQuadRocketBaselineConfig extends Config(
+  new chipyard.config.WithNPerfCounters(6) ++
   new WithResetVectorToBootROM ++
   new chipyard.config.WithNoTileClockGaters ++
   new chipyard.QuadRocketConfig)

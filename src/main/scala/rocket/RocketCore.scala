@@ -122,7 +122,7 @@ class RocketCustomCSRs(implicit p: Parameters) extends CustomCSRs with HasRocket
   def mimpid = CustomCSR.constant(CSRs.mimpid, BigInt(rocketParams.mimpid))
 
   // Systolic Control CSR (Head Node Control)
-  def systolicCSR = CustomCSR(0x800, BigInt(3), Some(BigInt(0))) // Address 0x800, Bit 0 & 1 writable
+  def systolicCSR = CustomCSR(0x800, BigInt(7), Some(BigInt(0))) // Address 0x800, Bits [2:0] writable
 
   // Systolic Data CSR: West/East axis (read West register, write East register)
   def systolicDataCSR = CustomCSR(0x801, (BigInt(1) << rocketParams.xLen) - 1, Some(BigInt(0)))
@@ -132,6 +132,7 @@ class RocketCustomCSRs(implicit p: Parameters) extends CustomCSRs with HasRocket
 
   def systolicMasterCtrl = getByIdOrElse(0x800, _.value(0), false.B)
   def systolicSimdMode   = getByIdOrElse(0x800, _.value(1), false.B)
+  def systolicLoadGate   = getByIdOrElse(0x800, _.value(2), false.B)
   def systolicDataOut    = getByIdOrElse(0x801, _.wdata, 0.U)
   def systolicDataWen    = getByIdOrElse(0x801, _.wen, false.B)
   def systolicSouthOut   = getByIdOrElse(0x802, _.wdata, 0.U)
@@ -200,6 +201,10 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val systolic_south_auto_data = Output(UInt(xLen.W))  // MUL result → south
     val systolic_south_auto_wen  = Output(Bool())
 
+    // SIMD Memory Token Ring
+    val simd_mem_token   = Input(UInt(2.W))   // Which core currently holds the D-cache token
+    val simd_mem_active  = Output(Bool())     // Core has in-flight D-cache operation
+
   })
 }
 
@@ -260,7 +265,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       ++ (if (!usingMulDiv) Seq() else Seq(
         ("mul/div interlock", () => id_ex_hazard && (ex_ctrl.mul || ex_ctrl.div) || id_mem_hazard && (mem_ctrl.mul || mem_ctrl.div) || id_wb_hazard && wb_ctrl.div)))
       ++ (if (!usingFPU) Seq() else Seq(
-        ("fp interlock", () => id_ex_hazard && ex_ctrl.fp || id_mem_hazard && mem_ctrl.fp || id_wb_hazard && wb_ctrl.fp || id_ctrl.fp && id_stall_fpu)))),
+        ("fp interlock", () => id_ex_hazard && ex_ctrl.fp || id_mem_hazard && mem_ctrl.fp || id_wb_hazard && wb_ctrl.fp || id_ctrl.fp && id_stall_fpu)))
+      ++ Seq(("systolic stall", () => io.systolic_enable && io.systolic_stall))),
     new EventSet((mask, hits) => (mask & hits).orR, Seq(
       ("I$ miss", () => io.imem.perf.acquire),
       ("D$ miss", () => io.dmem.perf.acquire),
@@ -477,6 +483,24 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // for register-writing instructions (ALU, CSR reads, lui, auipc, loads)
     // and wxd=false for stores/fences. Forcing wxd=true on stores causes
     // false hazards and register corruption (the S-type imm field overlaps rd).
+
+    // [Load Gate] When CSR 0x800 bit 2 is set, suppress loads (not stores)
+    // on followers. We gate using mem_cmd (never written, no cycle risk)
+    // combined with the systolicLoadGate CSR bit.
+    // For integer loads: mem_cmd === M_XRD and mem is set by decoder
+    // For stores: mem_cmd === M_XWR — NOT gated, stores still work
+    val follower_gate_load = customCSRs.systolicLoadGate &&
+      (id_ctrl.mem_cmd === M_XRD) && !id_ctrl.fp
+    val follower_gate_fp_load = customCSRs.systolicLoadGate &&
+      io.fpu.dec.ldst && io.fpu.dec.wen
+    when (follower_gate_load) {
+      id_ctrl.mem := false.B
+      id_ctrl.wxd := false.B
+    }
+    when (follower_gate_fp_load) {
+      id_ctrl.mem := false.B
+      id_ctrl.fp  := false.B
+    }
   }
 
   val lgNXRegs = if (coreParams.useRVE) 4 else 5
@@ -1010,11 +1034,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // only the nacked core(s) re-issue to D-cache, eliminating contention.
   val replay_wb = local_replay_req || global_replay_wb
   
-  when (io.systolic_enable && (local_replay_req || global_replay_wb)) {
-    printf("C%d SYSTOLIC REPLAY pc=[%x] local=%d global=%d leader=%d participating=%d nack=%d\n",
-      io.hartid, wb_reg_pc, local_replay_req, global_replay_wb, is_leader, replay_wb, io.dmem.s2_nack)
-  }
-  
+
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
   // [Livelock Fix — Store-Done Tracking] When ANY core (leader or follower)
@@ -1182,8 +1202,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     lhs.wdata := rhs.wdata
     lhs.value := rhs.value
     rhs.stall := lhs.stall
-    // Do not wire PTW's set/sdata inputs; RocketCore will manually drive them later.
-    // If not driven later, they will default to false/0.
+    // Explicitly default set/sdata to prevent floating signals on FPGA.
+    // RocketCore may manually override these later via last-connect.
+    rhs.set := false.B
+    rhs.sdata := 0.U
+  }
+  // [Systolic Mesh] Override CSR 0x801/0x802 read values with mesh data.
+  // MUST come AFTER the PTW defaults above (Chisel last-connect semantics).
+  (csr.io.customCSRs zip coreParams.customCSRs.decls).foreach { case (rhs, decl) =>
+    if (decl.id == 0x801) {
+      rhs.sdata := io.systolic_opA   // Read: West shift register value
+      rhs.set := true.B
+    } else if (decl.id == 0x802) {
+      rhs.sdata := io.systolic_opB   // Read: North shift register value
+      rhs.set := true.B
+    }
   }
   io.ptw.status := csr.io.status
   io.ptw.hstatus := csr.io.hstatus
@@ -1334,7 +1367,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // [Fix A] Mask perma-kill from frozen IBuf replay
   val systolic_flush_applied = io.systolic_flush_in && id_systolic_follower
-  ctrl_killd := !id_effective_valid || (ibuf.io.inst(0).bits.replay && !id_systolic_follower) || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt || systolic_flush_applied
+  val id_instruction_logically_valid = id_effective_valid && !(ibuf.io.inst(0).bits.replay && !id_systolic_follower) && !take_pc_mem_wb && !csr.io.interrupt && !systolic_flush_applied
+  ctrl_killd := !id_instruction_logically_valid || ctrl_stalld
 
   // Drive global stall backpressure from LOCAL conditions only (no loop)
   //
@@ -1370,7 +1404,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   //   (a) Pipeline contains the done instruction (PC match) — replay in progress, OR
   //   (b) Pipeline is drained AND we're in an active replay round
   // For normal inter-instruction gaps (no replay), dcache_blocked propagates.
-  val follower_pipeline_active = ex_reg_valid || mem_reg_valid || wb_reg_valid
+  val follower_pipeline_active = id_effective_valid || ex_reg_valid || mem_reg_valid || wb_reg_valid
   io.systolic_stall_out := io.systolic_enable && Mux(is_leader,
     (ctrl_stalld_local && !simd_startup_bubble) || take_pc_mem_wb,
     (ctrl_stalld_local && follower_pipeline_active) || dcache_blocked
@@ -1471,7 +1505,13 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // avoid scoreboard deadlock. Only nacked cores (systolic_store_done=false) retry.
   val suppress_done_store = systolic_store_done && io.systolic_enable &&
     !isRead(ex_ctrl.mem_cmd) && ex_reg_pc === systolic_done_pc
+  // [Token Ring disabled — causes livelock with SIMD stall OR-tree]
+  // simd_mem_blocked kept as false to avoid removing interface signals
+  val simd_mem_blocked = false.B
   io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem && !suppress_done_store
+  // [Drain] Signal that this core has an ISSUED D-cache op in-flight.
+  // Only count MEM/WB stages — used by SystolicMesh drain logic.
+  io.simd_mem_active := (mem_reg_valid && mem_ctrl.mem) || (wb_ctrl.mem && wb_reg_valid)
   val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
   require(coreParams.dcacheReqTagBits >= ex_dcache_tag.getWidth)
   io.dmem.req.bits.tag  := ex_dcache_tag
@@ -1491,26 +1531,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   io.dmem.s1_data.data := (if (fLen == 0) mem_reg_rs2 else Mux(mem_ctrl.fp, Fill(coreDataBits / fLen, io.fpu.store_data), mem_reg_rs2))
   io.dmem.s1_data.mask := DontCare
-
-  // === SIMD STORE DEBUG (remove after debugging) ===
-  // EX stage: print store address and suppression info when a SIMD mem op is in EX
-  when (io.systolic_enable && ex_reg_valid && ex_ctrl.mem) {
-    printf("STORE_EX C%d pc=%x addr=%x rs1=%x alu_out=%x cmd=%d suppress=%d done=%d done_pc=%x\n",
-      io.hartid, ex_reg_pc, io.dmem.req.bits.addr,
-      ex_rs(0), alu.io.adder_out, ex_ctrl.mem_cmd,
-      suppress_done_store, systolic_store_done, systolic_done_pc)
-  }
-  // MEM stage: print store data
-  when (io.systolic_enable && mem_reg_valid && mem_ctrl.mem && !isRead(mem_ctrl.mem_cmd)) {
-    printf("STORE_MEM C%d pc=%x data=%x rs2=%x\n",
-      io.hartid, mem_reg_pc, mem_reg_rs2, mem_reg_rs2)
-  }
-  // WB stage: print CSR read results (when CSR op commits)
-  when (io.systolic_enable && wb_valid && wb_ctrl.csr =/= CSR.N) {
-    printf("CSR_WB C%d pc=%x addr=%x rdata=%x waddr=%d\n",
-      io.hartid, wb_reg_pc, wb_reg_inst(31,20), csr.io.rw.rdata, wb_waddr)
-  }
-
 
   io.dmem.s1_kill := killm_common || mem_ldst_xcpt || fpu_kill_mem || vec_kill_mem
   io.dmem.s2_kill := false.B
@@ -1540,16 +1560,14 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       io.dmem.replay_next || // long-latency load replaying
       (!long_latency_stall && (ibuf.io.inst(0).valid || io.imem.resp.valid)) // instruction pending
 
-    io.systolic_stall_out := (dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
+    io.systolic_stall_out := io.systolic_enable && ((dcache_blocked && !local_replay_req) || (io.systolic_master_ctrl && (
       io.dmem.replay_next || // long-latency load replaying
       take_pc_wb || // pipeline flushes (eret, branch redirects)
       csr.io.interrupt       // async interrupts
-    ))
+    )))
 
-    when (io.systolic_enable && (io.systolic_stall_out || io.systolic_stall)) {
-      printf("C%d SYSTOLIC STALL pc=[%x] out=%d in=%d dcache_blk=%d local_req=%d\n",
-        io.hartid, wb_reg_pc, io.systolic_stall_out, io.systolic_stall, dcache_blocked, local_replay_req)
-    }
+
+
 
     assert(!(ex_pc_valid || mem_pc_valid || wb_pc_valid) || clock_en)
   }
@@ -1648,7 +1666,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     // Instruction Broadcast Export
     io.systolic_instruction_out := id_inst(0)
-    io.systolic_instruction_valid_out := is_leader && !ctrl_killd
+    io.systolic_instruction_valid_out := is_leader && id_instruction_logically_valid && !simd_startup_bubble
 
     // [SIMD Loop] Broadcast leader's BTB prediction to followers
     io.systolic_btb_taken_out := is_leader && ibuf.io.btb_resp.taken
