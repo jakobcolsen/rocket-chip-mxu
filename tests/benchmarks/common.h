@@ -54,9 +54,65 @@ static volatile uint64_t _bench_inst0, _bench_inst1;
     printf("INSTRET: %lu\n", (unsigned long)(_bench_inst1 - _bench_inst0)); \
 } while(0)
 
+/* ── Hardware Performance Monitor Counters ─────────────────────────── */
+/* Rocket EventSets encoding: selector = (event_mask << 8) | set_id
+ *   set_id=0: instruction types (load, store, fp mul-add, ...)
+ *   set_id=1: pipeline events (load-use, D$ blocked, CSR interlock, ...)
+ *   set_id=2: cache events (I$ miss, D$ miss, ...)
+ * event_mask: bitmask selecting which event(s) within the set.
+ */
+
+#define HPM_EVT_DCACHE_MISS     ((1UL << 1) << 8 | 2)  /* set 2, bit 1 */
+#define HPM_EVT_SYSTOLIC_STALL  ((1UL << 11) << 8 | 1) /* set 1, bit 11 */
+#define HPM_EVT_LOAD_USE        ((1UL << 0) << 8 | 1)  /* set 1, bit 0 */
+#define HPM_EVT_DCACHE_BLOCKED  ((1UL << 4) << 8 | 1)  /* set 1, bit 4 */
+#define HPM_EVT_CSR_INTERLOCK   ((1UL << 2) << 8 | 1)  /* set 1, bit 2 */
+#define HPM_EVT_FP_MULADD       ((1UL << 15) << 8 | 0) /* set 0, bit 15 */
+
+static volatile uint64_t _hpm3_0, _hpm3_1, _hpm4_0, _hpm4_1;
+static volatile uint64_t _hpm5_0, _hpm5_1, _hpm6_0, _hpm6_1;
+static volatile uint64_t _hpm7_0, _hpm7_1, _hpm8_0, _hpm8_1;
+
+#define HPM_SETUP() do { \
+    write_csr(mhpmevent3, HPM_EVT_DCACHE_MISS); \
+    write_csr(mhpmevent4, HPM_EVT_SYSTOLIC_STALL); \
+    write_csr(mhpmevent5, HPM_EVT_LOAD_USE); \
+    write_csr(mhpmevent6, HPM_EVT_DCACHE_BLOCKED); \
+    write_csr(mhpmevent7, HPM_EVT_CSR_INTERLOCK); \
+    write_csr(mhpmevent8, HPM_EVT_FP_MULADD); \
+} while(0)
+
+#define HPM_START() do { \
+    _hpm3_0 = read_csr(mhpmcounter3); \
+    _hpm4_0 = read_csr(mhpmcounter4); \
+    _hpm5_0 = read_csr(mhpmcounter5); \
+    _hpm6_0 = read_csr(mhpmcounter6); \
+    _hpm7_0 = read_csr(mhpmcounter7); \
+    _hpm8_0 = read_csr(mhpmcounter8); \
+} while(0)
+
+#define HPM_END() do { \
+    _hpm3_1 = read_csr(mhpmcounter3); \
+    _hpm4_1 = read_csr(mhpmcounter4); \
+    _hpm5_1 = read_csr(mhpmcounter5); \
+    _hpm6_1 = read_csr(mhpmcounter6); \
+    _hpm7_1 = read_csr(mhpmcounter7); \
+    _hpm8_1 = read_csr(mhpmcounter8); \
+} while(0)
+
+#define HPM_REPORT() do { \
+    printf("DCACHE_MISS: %lu\n",    (unsigned long)(_hpm3_1 - _hpm3_0)); \
+    printf("SYSTOLIC_STALL: %lu\n", (unsigned long)(_hpm4_1 - _hpm4_0)); \
+    printf("LOAD_USE: %lu\n",       (unsigned long)(_hpm5_1 - _hpm5_0)); \
+    printf("DCACHE_BLOCKED: %lu\n", (unsigned long)(_hpm6_1 - _hpm6_0)); \
+    printf("CSR_INTERLOCK: %lu\n",  (unsigned long)(_hpm7_1 - _hpm7_0)); \
+    printf("FP_MULADD: %lu\n",      (unsigned long)(_hpm8_1 - _hpm8_0)); \
+} while(0)
+
 /* ── SIMD Helpers ─────────────────────────────────────────────────────── */
 
 #define SIMD_ENABLE()  asm volatile ("csrw 0x800, %0" :: "r"(2))
+#define SIMD_ENABLE_LOADGATE() asm volatile ("csrw 0x800, %0" :: "r"(6))  // bits 2+1: SIMD + load gate
 #define SIMD_DISABLE() asm volatile ("csrw 0x800, x0")
 
 /* Park follower cores after SIMD region ends */
@@ -91,6 +147,7 @@ static inline void mimd_barrier_wait(volatile int *done_cnt, int expected) {
 static inline void bench_disable_interrupts(void) {
     clear_csr(mstatus, MSTATUS_MIE);
     write_csr(mie, 0);
+    set_csr(mstatus, MSTATUS_FS_INIT);
 }
 
 /* Stub for crt.S thread_entry */

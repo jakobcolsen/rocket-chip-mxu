@@ -16,7 +16,7 @@
 #define ALIAS_PAD 16 // 64 bytes of offset per core to prevent L2 set aliasing
 
 /* Cache-line aligned arrays, with extra room for the padding offsets */
-volatile int32_t X[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
+int32_t X[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
 volatile int32_t Y[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
 
 static void __attribute__((noinline)) simd_axpy_kernel(void) {

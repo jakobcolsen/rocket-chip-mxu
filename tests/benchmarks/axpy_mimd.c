@@ -13,9 +13,11 @@
 #define SCALAR_A  3
 #define SLICE     (BENCH_N / NUM_CORES)
 
+#define ALIAS_PAD 16
+
 /* Cache-line aligned arrays */
-volatile int32_t X[BENCH_N] __attribute__((aligned(64)));
-volatile int32_t Y[BENCH_N] __attribute__((aligned(64)));
+int32_t X[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
+volatile int32_t Y[BENCH_N + 4 * ALIAS_PAD] __attribute__((aligned(64)));
 
 /* Fork-join control */
 volatile int go       = 0;
@@ -33,7 +35,7 @@ int main(void) {
 
     if (hartid == 0) {
         /* Initialize arrays */
-        for (int i = 0; i < BENCH_N; i++) {
+        for (int i = 0; i < BENCH_N + 4 * ALIAS_PAD; i++) {
             X[i] = i + 1;
             Y[i] = 100 + i;
         }
@@ -49,7 +51,7 @@ int main(void) {
         asm volatile ("fence rw, rw" ::: "memory");
 
         /* Leader computes its own slice */
-        axpy_slice(0, SLICE);
+        axpy_slice(0, 0 + SLICE);
 
         /* Wait for all followers to finish */
         mimd_barrier_wait(&done_cnt, NUM_CORES - 1);
@@ -59,13 +61,17 @@ int main(void) {
 
         /* Verify */
         int passed = 1;
-        for (int i = 0; i < BENCH_N; i++) {
-            int32_t expected = SCALAR_A * (i + 1) + (100 + i);
-            if (Y[i] != expected) {
-                printf("  MISMATCH Y[%d] = %d, expected %d\n",
-                       i, (int)Y[i], (int)expected);
-                passed = 0;
-                if (i > 5) { printf("  ... (more errors)\n"); break; }
+        for (int c = 0; c < NUM_CORES; c++) {
+            int start = c * SLICE + (c * ALIAS_PAD);
+            int end   = start + SLICE;
+            for (int i = start; i < end; i++) {
+                int32_t expected = SCALAR_A * (i + 1) + (100 + i);
+                if (Y[i] != expected) {
+                    printf("  MISMATCH core %d Y[%d] = %d, expected %d\n",
+                           c, i, (int)Y[i], (int)expected);
+                    passed = 0;
+                    if (i > start + 5) { printf("  ... (more errors)\n"); break; }
+                }
             }
         }
 
@@ -81,7 +87,7 @@ int main(void) {
         asm volatile ("fence rw, rw" ::: "memory");
 
         /* Compute my slice */
-        int start = hartid * SLICE;
+        int start = hartid * SLICE + (hartid * ALIAS_PAD);
         int end   = start + SLICE;
         axpy_slice(start, end);
 

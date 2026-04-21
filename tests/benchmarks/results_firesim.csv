@@ -1,2 +1,0 @@
-benchmark,mode,N,cycles,instret,ipc,ops_per_cycle,pass
-axpy_mimd,mimd,65536,N/A,N/A,0,0,FAIL

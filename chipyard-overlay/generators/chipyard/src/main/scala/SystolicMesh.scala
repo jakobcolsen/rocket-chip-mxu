@@ -119,7 +119,7 @@ trait HasSystolicMeshModule { this: ChipyardSystemModule =>
       // the token may issue D-cache requests — this serializes memory
       // access and prevents D-cache contention.
       val mem_token = RegInit(0.U(2.W))
-      val current_holder_mem_active = sys_outputs(mem_token).simd_mem_active
+      val current_holder_mem_active = VecInit(sys_outputs.map(_.simd_mem_active))(mem_token)
       when (effective_enable && !global_stall && !current_holder_mem_active) {
         mem_token := Mux(mem_token === (count - 1).U, 0.U, mem_token + 1.U)
       }

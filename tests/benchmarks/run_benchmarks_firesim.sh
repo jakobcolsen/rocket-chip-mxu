@@ -17,12 +17,12 @@
 set -e
 
 # ── Configuration ──────────────────────────────────────────────────────
-CHIPYARD_DIR="/home/jolsen16/chipyard"
+CHIPYARD_DIR="${CHIPYARD:-$HOME/chipyard}"
 FIRESIM_DIR="$CHIPYARD_DIR/sims/firesim"
 DEPLOY_DIR="$FIRESIM_DIR/deploy"
 WORKLOADS_DIR="$DEPLOY_DIR/workloads"
 RUNTIME_YAML="$DEPLOY_DIR/config_runtime.yaml"
-SIM_SLOT_DIR="/home/jolsen16/FIRESIM_RUNS_DIR/sim_slot_0"
+SIM_SLOT_DIR="${HOME}/FIRESIM_RUNS_DIR/sim_slot_0"
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_CSV="$BENCH_DIR/results_firesim.csv"
