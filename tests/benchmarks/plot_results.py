@@ -4,13 +4,15 @@ plot_results.py — Thesis-quality plots from benchmark results.
 
 Usage: python3 plot_results.py [results.csv]
 
-Generates 6 publication-quality figures:
-  1. Cycles vs Matrix Size (grouped bar)
-  2. Speedup over Single-Core (line)
-  3. Cycles per FLOP (bar)
-  4. D-cache Miss Rate (bar)
-  5. Pipeline Stall Breakdown (stacked bar)
-  6. MXU vs Vanilla Rocket Regression (bar)
+Generates 5 publication-quality, grayscale-safe figures:
+  1. Cycles vs Matrix Size (line)
+  2. MFLOP/s Throughput @ 100 MHz (line)
+  3. D-cache Miss Count (line)
+  4. Pipeline Stall Breakdown (stacked bar + hatching)
+  5. MXU vs Vanilla Rocket Regression (grouped bar + hatching)
+
+All figures use distinct markers, line styles, and hatching patterns
+to ensure readability for monochromatic color-blind viewers.
 """
 
 import sys
@@ -35,18 +37,41 @@ plt.rcParams.update({
     'grid.alpha': 0.3,
 })
 
-COLORS = {
-    'gemm_single': '#888888',
-    'gemm_mimd':   '#4A90D9',
-    'gemm_simd':   '#50C878',
-    'gemm_csr':    '#F5A623',
+# ── Grayscale-safe style definitions ─────────────────────────────────
+# Each benchmark gets a unique (color, marker, linestyle, hatch) tuple
+# so the plots are fully readable in pure grayscale.
+SERIES = {
+    'gemm_single': {
+        'label': 'Single-Core',
+        'color': '#888888',       # gray
+        'marker': 'o',            # circle
+        'linestyle': '-',         # solid
+        'hatch': '',              # solid fill
+    },
+    'gemm_mimd': {
+        'label': 'MIMD (4-core)',
+        'color': '#4A90D9',       # blue
+        'marker': 's',            # square
+        'linestyle': '--',        # dashed
+        'hatch': '//',
+    },
+    'gemm_simd': {
+        'label': 'SIMD (4-core)',
+        'color': '#50C878',       # green
+        'marker': '^',            # triangle
+        'linestyle': ':',         # dotted
+        'hatch': '\\\\',
+    },
+    'gemm_csr': {
+        'label': 'CSR Systolic (4-core)',
+        'color': '#F5A623',       # orange
+        'marker': 'D',            # diamond
+        'linestyle': '-.',        # dash-dot
+        'hatch': 'xx',
+    },
 }
-LABELS = {
-    'gemm_single': 'Single-Core',
-    'gemm_mimd':   'MIMD (4-core)',
-    'gemm_simd':   'SIMD (4-core)',
-    'gemm_csr':    'CSR Systolic (4-core)',
-}
+
+BENCH_ORDER = ['gemm_single', 'gemm_mimd', 'gemm_simd', 'gemm_csr']
 
 def load_csv(path):
     """Load results.csv into dict keyed by (benchmark, N, simulator)."""
@@ -62,127 +87,118 @@ def get_vals(data, bench, sizes, sim='mxu', field='cycles'):
     """Extract a field for a benchmark across sizes."""
     return [data.get((bench, s, sim), {}).get(field, 0) for s in sizes]
 
-def plot_cycles(data, sizes, outdir):
-    """Fig 1: Cycles vs Matrix Size — grouped bar chart."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    benchmarks = ['gemm_single', 'gemm_mimd', 'gemm_simd', 'gemm_csr']
-    x = np.arange(len(sizes))
-    width = 0.2
 
-    for i, bench in enumerate(benchmarks):
-        vals = get_vals(data, bench, sizes, field='cycles')
-        vals = [int(v) for v in vals]
-        bars = ax.bar(x + i * width, vals, width, label=LABELS[bench],
-                      color=COLORS[bench], edgecolor='white', linewidth=0.5)
-        for bar, v in zip(bars, vals):
-            if v > 0:
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                        f'{v}', ha='center', va='bottom', fontsize=7)
+# ── Fig 1: Cycles vs Matrix Size (line graph) ───────────────────────
+
+def plot_cycles(data, sizes, outdir):
+    """Fig 1: Cycles vs Matrix Size — line graph with markers."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for bench in BENCH_ORDER:
+        s = SERIES[bench]
+        vals = [int(v) for v in get_vals(data, bench, sizes, field='cycles')]
+        ax.plot(sizes, vals, marker=s['marker'], linestyle=s['linestyle'],
+                color=s['color'], label=s['label'], linewidth=2, markersize=8)
 
     ax.set_xlabel('Matrix Size (N×N)')
     ax.set_ylabel('Cycles')
-    ax.set_title('GEMM Execution Cycles by Mode')
-    ax.set_xticks(x + 1.5 * width)
-    ax.set_xticklabels([str(s) for s in sizes])
+    ax.set_title('GEMM Execution Cycles by Mode (lower is better)')
+    ax.set_xticks(sizes)
     ax.set_yscale('log')
     ax.legend()
+    fig.tight_layout()
     fig.savefig(os.path.join(outdir, 'fig1_cycles.png'))
     fig.savefig(os.path.join(outdir, 'fig1_cycles.pdf'))
     plt.close(fig)
     print("  Fig 1: Cycles vs Matrix Size")
 
-def plot_normalized_time(data, sizes, outdir):
-    """Fig 2: Normalized Execution Time (relative to MIMD baseline)."""
-    fig, ax = plt.subplots(figsize=(7, 5))
-    benchmarks = ['gemm_mimd', 'gemm_simd', 'gemm_csr']
 
-    mimd_cycles = get_vals(data, 'gemm_mimd', sizes, field='cycles')
-    mimd_cycles = [int(v) if int(v) > 0 else 1 for v in mimd_cycles]
+# ── Fig 2: MFLOP/s Throughput (line graph) ───────────────────────────
 
-    for bench in benchmarks:
-        vals = get_vals(data, bench, sizes, field='cycles')
-        vals = [int(v) if int(v) > 0 else 1 for v in vals]
-        # Normalized time = cycles / mimd_cycles
-        norm_time = [v / m for v, m in zip(vals, mimd_cycles)]
-        ax.plot(sizes, norm_time, 'o-', label=LABELS[bench],
-                color=COLORS[bench], linewidth=2, markersize=8)
-
-    ax.axhline(y=1, color='gray', linestyle=':', alpha=0.5, label='MIMD Baseline')
-    ax.set_ylabel('Execution Time (Normalized to MIMD)')
-    ax.set_title('Normalized Execution Time (Lower is Better)')
-    ax.set_xticks(sizes)
-    ax.legend()
-    fig.savefig(os.path.join(outdir, 'fig2_normalized_time.png'))
-    fig.savefig(os.path.join(outdir, 'fig2_normalized_time.pdf'))
-    plt.close(fig)
-    print("  Fig 2: Normalized Time vs MIMD")
-
-def plot_cycles_per_flop(data, sizes, outdir):
-    """Fig 3: Cycles per FLOP — compute utilization."""
+def plot_mflops(data, sizes, outdir):
+    """Fig 2: MFLOP/s throughput assuming 100 MHz clock."""
+    CLOCK_HZ = 100e6  # 100 MHz (verified via Vivado implementation)
     fig, ax = plt.subplots(figsize=(8, 5))
-    benchmarks = ['gemm_single', 'gemm_mimd', 'gemm_simd', 'gemm_csr']
-    x = np.arange(len(sizes))
-    width = 0.2
 
-    for i, bench in enumerate(benchmarks):
+    for bench in BENCH_ORDER:
+        s = SERIES[bench]
         vals = get_vals(data, bench, sizes, field='cycles')
-        cpf = [int(v) / (2.0 * s**3) if int(v) > 0 else 0 for v, s in zip(vals, sizes)]
-        ax.bar(x + i * width, cpf, width, label=LABELS[bench],
-               color=COLORS[bench], edgecolor='white', linewidth=0.5)
+        mflops = [(2.0 * sz**3) / (int(v) / CLOCK_HZ) / 1e6 if int(v) > 0 else 0
+                  for v, sz in zip(vals, sizes)]
+        ax.plot(sizes, mflops, marker=s['marker'], linestyle=s['linestyle'],
+                color=s['color'], label=s['label'], linewidth=2, markersize=8)
 
     ax.set_xlabel('Matrix Size (N×N)')
-    ax.set_ylabel('Cycles / FLOP')
-    ax.set_title('Compute Utilization (lower = better)')
-    ax.set_xticks(x + 1.5 * width)
-    ax.set_xticklabels([str(s) for s in sizes])
+    ax.set_ylabel('MFLOP/s')
+    ax.set_title('Compute Throughput @ 100 MHz (higher is better)')
+    ax.set_xticks(sizes)
     ax.legend()
-    fig.savefig(os.path.join(outdir, 'fig3_cycles_per_flop.png'))
-    fig.savefig(os.path.join(outdir, 'fig3_cycles_per_flop.pdf'))
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'fig2_mflops.png'))
+    fig.savefig(os.path.join(outdir, 'fig2_mflops.pdf'))
     plt.close(fig)
-    print("  Fig 3: Cycles per FLOP")
+    print("  Fig 2: MFLOP/s Throughput")
+
+
+# ── Fig 3: D-cache Miss Count (line graph) ──────────────────────────
 
 def plot_dcache_miss(data, sizes, outdir):
-    """Fig 4: D-cache miss count per mode."""
+    """Fig 3: D-cache miss count per mode."""
     fig, ax = plt.subplots(figsize=(8, 5))
-    benchmarks = ['gemm_single', 'gemm_mimd', 'gemm_simd', 'gemm_csr']
-    x = np.arange(len(sizes))
-    width = 0.2
 
-    for i, bench in enumerate(benchmarks):
-        vals = get_vals(data, bench, sizes, field='dcache_miss')
-        vals = [int(v) for v in vals]
-        ax.bar(x + i * width, vals, width, label=LABELS[bench],
-               color=COLORS[bench], edgecolor='white', linewidth=0.5)
+    for bench in BENCH_ORDER:
+        s = SERIES[bench]
+        vals = [int(v) for v in get_vals(data, bench, sizes, field='dcache_miss')]
+        ax.plot(sizes, vals, marker=s['marker'], linestyle=s['linestyle'],
+                color=s['color'], label=s['label'], linewidth=2, markersize=8)
+        for x, v in zip(sizes, vals):
+            if v > 0:
+                ax.annotate(f'{v}', (x, v), textcoords='offset points',
+                            xytext=(0, 8), ha='center', fontsize=7)
 
     ax.set_xlabel('Matrix Size (N×N)')
     ax.set_ylabel('D-cache Misses')
-    ax.set_title('D-cache Miss Count by Mode')
-    ax.set_xticks(x + 1.5 * width)
-    ax.set_xticklabels([str(s) for s in sizes])
+    ax.set_title('D-cache Miss Count by Mode (lower is better)')
+    ax.set_xticks(sizes)
     ax.legend()
-    fig.savefig(os.path.join(outdir, 'fig4_dcache_miss.png'))
-    fig.savefig(os.path.join(outdir, 'fig4_dcache_miss.pdf'))
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'fig3_dcache_miss.png'))
+    fig.savefig(os.path.join(outdir, 'fig3_dcache_miss.pdf'))
     plt.close(fig)
-    print("  Fig 4: D-cache Miss Count")
+    print("  Fig 3: D-cache Miss Count")
+
+
+# ── Fig 4: Pipeline Stall Breakdown (stacked bar + hatching) ────────
 
 def plot_stall_breakdown(data, sizes, outdir):
-    """Fig 5: Pipeline stall breakdown — stacked bar per mode."""
-    fig, axes = plt.subplots(1, len(sizes), figsize=(4 * len(sizes), 5), sharey=False)
+    """Fig 4: Pipeline stall breakdown — stacked bar per mode."""
+    fig, axes = plt.subplots(1, len(sizes), figsize=(3 * len(sizes), 6), sharey=False)
     if len(sizes) == 1:
         axes = [axes]
-    benchmarks = ['gemm_single', 'gemm_mimd', 'gemm_simd', 'gemm_csr']
+
     stall_fields = ['load_use', 'dcache_blocked', 'csr_interlock', 'systolic_stall']
-    stall_colors = ['#E74C3C', '#3498DB', '#F39C12', '#9B59B6']
-    stall_labels = ['Load-Use', 'D$ Blocked', 'CSR Interlock', 'SIMD Stall']
+    # Grayscale-safe: distinct luminance + hatching per stall category
+    stall_styles = [
+        {'color': '#E74C3C', 'hatch': '',     'label': 'Load-Use'},
+        {'color': '#3498DB', 'hatch': '//',   'label': 'D$ Blocked'},
+        {'color': '#F39C12', 'hatch': '\\\\', 'label': 'CSR Interlock'},
+        {'color': '#9B59B6', 'hatch': 'xx',   'label': 'SIMD Stall'},
+    ]
 
     for ax, sz in zip(axes, sizes):
-        x = np.arange(len(benchmarks))
-        bottom = np.zeros(len(benchmarks))
-        for field, color, label in zip(stall_fields, stall_colors, stall_labels):
-            vals = [int(data.get((b, sz, 'mxu'), {}).get(field, 0)) for b in benchmarks]
-            ax.bar(x, vals, 0.6, bottom=bottom, color=color, label=label,
+        x = np.arange(len(BENCH_ORDER))
+        bottom = np.zeros(len(BENCH_ORDER))
+        for field, style in zip(stall_fields, stall_styles):
+            vals = [int(data.get((b, sz, 'mxu'), {}).get(field, 0)) for b in BENCH_ORDER]
+            ax.bar(x, vals, 0.6, bottom=bottom, color=style['color'],
+                   hatch=style['hatch'], label=style['label'],
                    edgecolor='white', linewidth=0.5)
             bottom += np.array(vals)
+
+        # Total stall count above each bar
+        for xi, total in enumerate(bottom):
+            if total > 0:
+                ax.text(xi, total, f'{int(total)}', ha='center', va='bottom', fontsize=7)
 
         ax.set_title(f'N={sz}')
         ax.set_xticks(x)
@@ -190,16 +206,19 @@ def plot_stall_breakdown(data, sizes, outdir):
 
     for ax in axes:
         ax.set_ylabel('Stall Cycles')
-    axes[-1].legend(loc='upper right')
-    fig.suptitle('Pipeline Stall Breakdown')
-    fig.tight_layout()
-    fig.savefig(os.path.join(outdir, 'fig5_stall_breakdown.png'))
-    fig.savefig(os.path.join(outdir, 'fig5_stall_breakdown.pdf'))
+    axes[0].legend(loc='upper left')
+    fig.suptitle('Pipeline Stall Breakdown (lower is better)')
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(os.path.join(outdir, 'fig4_stall_breakdown.png'))
+    fig.savefig(os.path.join(outdir, 'fig4_stall_breakdown.pdf'))
     plt.close(fig)
-    print("  Fig 5: Pipeline Stall Breakdown")
+    print("  Fig 4: Pipeline Stall Breakdown")
+
+
+# ── Fig 5: MXU vs Vanilla Regression (grouped bar + hatching) ───────
 
 def plot_regression(data, sizes, outdir):
-    """Fig 6: MXU vs Vanilla Rocket — MIMD regression test."""
+    """Fig 5: MXU vs Vanilla Rocket — MIMD regression test."""
     fig, ax = plt.subplots(figsize=(7, 5))
     x = np.arange(len(sizes))
     width = 0.35
@@ -207,42 +226,63 @@ def plot_regression(data, sizes, outdir):
     mxu_vals = [int(data.get(('gemm_mimd', s, 'mxu'), {}).get('cycles', 0)) for s in sizes]
     van_vals = [int(data.get(('gemm_mimd', s, 'vanilla'), {}).get('cycles', 0)) for s in sizes]
 
-    ax.bar(x - width/2, mxu_vals, width, label='MIMD on MXU Rocket',
-           color=COLORS['gemm_mimd'], edgecolor='white')
-    ax.bar(x + width/2, van_vals, width, label='MIMD on Vanilla Rocket',
-           color='#E74C3C', edgecolor='white')
+    mxu_bars = ax.bar(x - width/2, mxu_vals, width, label='MIMD on MXU Rocket',
+                      color='#4A90D9', edgecolor='black', linewidth=0.5)
+    van_bars = ax.bar(x + width/2, van_vals, width, label='MIMD on Vanilla Rocket',
+                      color='#E74C3C', hatch='//', edgecolor='black', linewidth=0.5)
 
+    # Value labels on each bar
+    for bar, v in zip(mxu_bars, mxu_vals):
+        if v > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{v}', ha='center', va='bottom', fontsize=7)
+    for bar, v in zip(van_bars, van_vals):
+        if v > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{v}', ha='center', va='bottom', fontsize=7)
+
+    # Percentage difference annotation
     for xi, (m, v) in enumerate(zip(mxu_vals, van_vals)):
         if m > 0 and v > 0:
             pct = (m - v) / v * 100
-            ax.text(xi, max(m, v) * 1.05, f'{pct:+.1f}%', ha='center', fontsize=9)
+            y_pos = max(m, v) * 0.5
+            ax.text(xi, y_pos, f'{pct:+.1f}%', ha='center', va='center',
+                    fontsize=9, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
 
     ax.set_xlabel('Matrix Size (N×N)')
     ax.set_ylabel('Cycles')
-    ax.set_title('MIMD Regression: MXU vs Vanilla Rocket')
+    ax.set_title('MIMD Regression: MXU vs Vanilla Rocket (lower is better)')
     ax.set_xticks(x)
     ax.set_xticklabels([str(s) for s in sizes])
     ax.legend()
-    fig.savefig(os.path.join(outdir, 'fig6_regression.png'))
-    fig.savefig(os.path.join(outdir, 'fig6_regression.pdf'))
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'fig5_regression.png'))
+    fig.savefig(os.path.join(outdir, 'fig5_regression.pdf'))
     plt.close(fig)
-    print("  Fig 6: MXU vs Vanilla Regression")
+    print("  Fig 5: MXU vs Vanilla Regression")
+
+
+# ── Summary Table ────────────────────────────────────────────────────
 
 def print_summary_table(data, sizes):
     """Print a summary table to terminal."""
     print("\n" + "="*90)
     print(f"{'Benchmark':<20} {'N':>4} {'Cycles':>8} {'Instret':>8} {'D$Miss':>7} {'SysStl':>7} {'LoadUse':>8} {'CSRStl':>7} {'FP-FMA':>7}")
     print("-"*90)
-    for bench in ['gemm_single', 'gemm_mimd', 'gemm_simd', 'gemm_csr']:
+    for bench in BENCH_ORDER:
         for s in sizes:
             d = data.get((bench, s, 'mxu'), {})
             if d:
-                print(f"{LABELS.get(bench, bench):<20} {s:>4} {int(d.get('cycles',0)):>8} "
+                print(f"{SERIES[bench]['label']:<20} {s:>4} {int(d.get('cycles',0)):>8} "
                       f"{int(d.get('instret',0)):>8} {int(d.get('dcache_miss',0)):>7} "
                       f"{int(d.get('systolic_stall',0)):>7} "
                       f"{int(d.get('load_use',0)):>8} {int(d.get('csr_interlock',0)):>7} "
                       f"{int(d.get('fp_muladd',0)):>7}")
     print("="*90)
+
+
+# ── Main ─────────────────────────────────────────────────────────────
 
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else 'results.csv'
@@ -261,8 +301,7 @@ def main():
     print(f"Generating plots from {csv_path} → {outdir}/")
 
     plot_cycles(data, sizes, outdir)
-    plot_normalized_time(data, sizes, outdir)
-    plot_cycles_per_flop(data, sizes, outdir)
+    plot_mflops(data, sizes, outdir)
     plot_dcache_miss(data, sizes, outdir)
     plot_stall_breakdown(data, sizes, outdir)
     plot_regression(data, sizes, outdir)
