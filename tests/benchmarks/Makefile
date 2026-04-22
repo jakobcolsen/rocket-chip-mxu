@@ -17,7 +17,7 @@ INCLUDES = -I. -I..
 
 # ── Problem sizes ──────────────────────────────────────────────────────
 AXPY_SIZES = 64 256 1024 4096
-GEMM_SIZES = 2 4 8 16 32
+GEMM_SIZES = 2 16 32 64 128
 
 # ── Generate target lists ─────────────────────────────────────────────
 AXPY_SIMD_TARGETS = $(foreach s,$(AXPY_SIZES),axpy_simd_$(s).riscv)
@@ -26,7 +26,6 @@ GEMM_CSR_TARGETS  = $(foreach s,$(GEMM_SIZES),gemm_csr_$(s).riscv)
 GEMM_SIMD_TARGETS = $(foreach s,$(GEMM_SIZES),gemm_simd_$(s).riscv)
 GEMM_MIMD_TARGETS = $(foreach s,$(GEMM_SIZES),gemm_mimd_$(s).riscv)
 GEMM_SINGLE_TARGETS = $(foreach s,$(GEMM_SIZES),gemm_single_$(s).riscv)
-
 ALL_TARGETS = $(AXPY_SIMD_TARGETS) $(AXPY_MIMD_TARGETS) \
               $(GEMM_CSR_TARGETS) \
               $(GEMM_SIMD_TARGETS) $(GEMM_MIMD_TARGETS) $(GEMM_SINGLE_TARGETS)
@@ -57,6 +56,8 @@ gemm_mimd_%.riscv: gemm_mimd.c common.h $(SUPPORT)
 
 gemm_single_%.riscv: gemm_single.c common.h $(SUPPORT)
 	$(CC) $(CFLAGS) -T $(LDSCRIPT) -DBENCH_N=$* $(INCLUDES) $(SUPPORT) $< -o $@
+
+
 
 
 clean:

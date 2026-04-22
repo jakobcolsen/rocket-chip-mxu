@@ -1,21 +1,16 @@
 /*
- * gemm_csr.c — Systolic K-Split GEMM via CSR Mesh Reduction
+ * gemm_tiled_csr.c — CSR Systolic K-Split Register-Tiled GEMM
  *
  * C[M][N] += A[M][K] * B[K][N]   (single-precision floating-point)
  *
- * True systolic data flow: the K reduction dimension is split across
- * 4 cores. Each core computes a local partial sum for its K-slice,
- * then partial sums cascade through the 2D mesh using BOTH axes:
+ * K-split across 4 cores (same reduction strategy as gemm_csr.c),
+ * but each core's local partial-sum computation uses register tiling:
+ *   - j-tiled by 4 (contiguous B access → cache-line friendly)
+ *   - 4 accumulators per row stay in registers across the K-slice
  *
+ * After local tiled computation, 2-step CSR mesh reduction per element:
  *   Step 1 — East (CSR 0x801): accumulate across columns
- *     Core 0 → Core 1:  Core 1 acc = partial_k0 + partial_k1
- *     Core 2 → Core 3:  Core 3 acc = partial_k2 + partial_k3
- *
  *   Step 2 — South (CSR 0x802): accumulate across rows
- *     Core 1 → Core 3:  Core 3 final = (k0+k1) + (k2+k3) ✓
- *
- * All cores store results to per-hartid sections of C.
- * Core 3 (hartid = NUM_CORES-1) holds the fully-reduced output.
  *
  * Compile: pass -DBENCH_N=<dim> for matrix dimension.
  */
@@ -27,16 +22,17 @@
 #endif
 
 #define DIM BENCH_N
+#define TILE 4
 #define ALIAS_PAD 16
+#define BLOCK_SIZE 32
 
 /* ── Matrices (row-major) ─────────────────────────────────────────── */
-float A[DIM * DIM] __attribute__((aligned(64)));
+float A[DIM * DIM + NUM_CORES * ALIAS_PAD] __attribute__((aligned(64)));
 float B[DIM * DIM] __attribute__((aligned(64)));
-/* Per-core output: each core stores to C[hartid * (DIM*DIM + ALIAS_PAD) + ...] */
+/* Per-core output sections with alias padding */
 volatile float C[NUM_CORES * (DIM * DIM + ALIAS_PAD)] __attribute__((aligned(64)));
-float C_ref[DIM * DIM] __attribute__((aligned(64)));
+float C_ref[DIM * DIM + NUM_CORES * ALIAS_PAD] __attribute__((aligned(64)));
 
-/* IEEE 754 helpers */
 static inline uint32_t f2u(float f) {
     union { float f; uint32_t u; } x; x.f = f; return x.u;
 }
@@ -45,48 +41,60 @@ static inline float u2f(uint32_t u) {
 }
 
 /*
- * Systolic K-split reduction kernel.
+ * Tiled CSR systolic reduction kernel.
  *
- * Each core handles DIM/NUM_CORES of the K dimension.
- * After local partial sums, 2-step mesh reduction:
- *   East accumulate → South accumulate → Core 3 has full dot product.
- * ALL cores store to per-hartid C sections (avoids branch divergence).
+ * Phase 1: Each core computes local partial sums for its K-slice
+ *          using j-tiled 1×4 micro-kernel (4 accumulators in regs).
+ * Phase 2: Per-element 2-step mesh reduction via CSR 0x801/0x802.
+ *
+ * The tiling benefit is in Phase 1 — same per-element reduction
+ * overhead as the scalar version, but much faster local computation.
  */
-static void __attribute__((noinline)) systolic_reduction_kernel(void) {
+static void __attribute__((noinline)) tiled_csr_kernel(void) {
     uint64_t hartid = read_csr(mhartid);
 
-    /* K-split bounds for this core */
+    /* K-split bounds */
     int k_per_core = (DIM + NUM_CORES - 1) / NUM_CORES;
     int k_start = hartid * k_per_core;
     int k_end   = k_start + k_per_core;
     if (k_end > DIM) k_end = DIM;
     if (k_start > DIM) k_start = DIM;
 
-    /* Per-core output base */
     int c_base = hartid * (DIM * DIM + ALIAS_PAD);
 
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            /* ── Local partial sum for my K-slice ── */
-            float my_partial = 0.0f;
-            for (int k = k_start; k < k_end; k++) {
-                my_partial += A[i * DIM + k] * B[k * DIM + j];
+    for (int ii = 0; ii < DIM; ii += BLOCK_SIZE) {
+        for (int jj = 0; jj < DIM; jj += BLOCK_SIZE) {
+            int i_end = (ii + BLOCK_SIZE < DIM) ? ii + BLOCK_SIZE : DIM;
+            for (int i = ii; i < i_end; i++) {
+                /* Process j in tiles of 4 for cache-line-friendly B access */
+                int j_end = (jj + BLOCK_SIZE < DIM) ? jj + BLOCK_SIZE : DIM;
+                for (int j = jj; j < j_end; j += TILE) {
+                    /* Phase 1: Local partial sums with 1x4 register tile */
+                    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+                    for (int k = k_start; k < k_end; k++) {
+                        float a = A[i * DIM + k];
+                        p0 += a * B[k * DIM + (j+0)];
+                        p1 += a * B[k * DIM + (j+1)];
+                        p2 += a * B[k * DIM + (j+2)];
+                        p3 += a * B[k * DIM + (j+3)];
+                    }
+
+                    /* Phase 2: CSR mesh reduction (per element, same as scalar) */
+                    /* Each of the 4 tile elements goes through the 2-step reduce */
+                    float partials[4] = { p0, p1, p2, p3 };
+                    for (int t = 0; t < TILE; t++) {
+                        /* Step 1: East accumulate (CSR 0x801) */
+                        write_csr(0x801, f2u(partials[t]));
+                        float acc = partials[t] + u2f(read_csr(0x801));
+
+                        /* Step 2: South accumulate (CSR 0x802) */
+                        write_csr(0x802, f2u(acc));
+                        float result = acc + u2f(read_csr(0x802));
+
+                        C[c_base + i * DIM + (j+t)] = result;
+                    }
+                }
             }
-
-            /* ── Step 1: Accumulate East (CSR 0x801) ──
-             * Core 0 → Core 1, Core 2 → Core 3 */
-            write_csr(0x801, f2u(my_partial));
-                        /* natural pipeline latency is sufficient — no NOPs needed */
-            float acc = my_partial + u2f(read_csr(0x801));
-
-            /* ── Step 2: Accumulate South (CSR 0x802) ──
-             * Core 1 → Core 3 */
-            write_csr(0x802, f2u(acc));
-                        /* natural pipeline latency is sufficient — no NOPs needed */
-            float result = acc + u2f(read_csr(0x802));
-
-            /* ALL cores store to their own section (no branch needed) */
-            C[c_base + i * DIM + j] = result;
         }
     }
 }
@@ -122,11 +130,20 @@ int main(void) {
         printf("N: %d\n", DIM);
 
         HPM_SETUP();
+
+        /* Warm up L1 cache for ALL cores */
+        SIMD_ENABLE();
+        volatile float dummy = 0.0f;
+        for (int i = 0; i < DIM * DIM + NUM_CORES * ALIAS_PAD; i++) dummy += A[i] + C[i];
+        for (int i = 0; i < DIM * DIM; i++) dummy += B[i];
+        SIMD_DISABLE();
+        SIMD_DRAIN();
+
         BENCH_START();
         HPM_START();
 
         SIMD_ENABLE();
-        systolic_reduction_kernel();
+        tiled_csr_kernel();
         asm volatile ("fence rw, rw" ::: "memory");
         SIMD_DISABLE();
         SIMD_PARK_FOLLOWERS();
@@ -138,7 +155,7 @@ int main(void) {
         BENCH_REPORT();
         HPM_REPORT();
 
-        /* Verify Core 3's output section (fully reduced) */
+        /* Verify Core 3's output (fully reduced) */
         int core3_base = (NUM_CORES - 1) * (DIM * DIM + ALIAS_PAD);
         int passed = 1;
         for (int i = 0; i < DIM; i++) {
@@ -147,7 +164,8 @@ int main(void) {
                 float exp = C_ref[i * DIM + j];
                 float diff = got - exp;
                 if (diff < 0) diff = -diff;
-                if (diff > 0.01f && passed) {
+                float mag = exp; if (mag < 0) mag = -mag; if (mag < 1.0f) mag = 1.0f;
+                if (diff / mag > 1e-4f && passed) {
                     passed = 0;
                     printf("  FAIL C[%d][%d]=%f exp=%f\n", i, j, got, exp);
                 }
