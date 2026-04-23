@@ -27,10 +27,12 @@ from collections import defaultdict
 # ── Style ────────────────────────────────────────────────────────────
 plt.rcParams.update({
     'font.family': 'serif',
-    'font.size': 11,
-    'axes.titlesize': 13,
-    'axes.labelsize': 12,
-    'legend.fontsize': 10,
+    'font.size': 12,
+    'axes.titlesize': 15,
+    'axes.labelsize': 13,
+    'legend.fontsize': 11,
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
     'figure.dpi': 150,
     'savefig.dpi': 300,
     'axes.grid': True,
@@ -88,21 +90,114 @@ def get_vals(data, bench, sizes, sim='mxu', field='cycles'):
     return [data.get((bench, s, sim), {}).get(field, 0) for s in sizes]
 
 
+# ── Accessible annotation helper ─────────────────────────────────────
+
+# Short prefixes so labels are identifiable without color (accessibility)
+TAG = {
+    'gemm_single': 'SC',
+    'gemm_mimd':   'MIMD',
+    'gemm_simd':   'SIMD',
+    'gemm_csr':    'CSR',
+}
+
+
+def _annotate_clusters(ax, sizes, bench_vals, is_log=False, y_cap=None,
+                       fmt=lambda v: f'{v:,}'):
+    """Smart annotation: cluster close points and stack labels above them.
+
+    At each x-position, points within a proximity threshold are grouped.
+    Each group's labels are stacked above the topmost data point in
+    legend order (SC -> MI -> SI -> CSR, top to bottom) so the plot is
+    fully readable in monochromatic grayscale.
+
+    For points that exceed y_cap (linear-scale plots only), an arrow
+    annotation is placed near the top of the chart.
+    """
+    label_h = 16  # approx label height in points (scaled for publication)
+
+    for xi, x in enumerate(sizes):
+        # Collect (bench, value) at this x
+        points = []
+        for bench in BENCH_ORDER:
+            v = bench_vals.get(bench, [0] * len(sizes))[xi]
+            if v > 0:
+                points.append((bench, v))
+
+        if not points:
+            continue
+
+        # Sort ascending by value
+        points.sort(key=lambda p: p[1])
+
+        # Group points that are "close" on the visible scale
+        if is_log:
+            def closeness(a, b):
+                return np.log10(b) - np.log10(a) < 0.15
+        else:
+            visible_range = y_cap if y_cap else (points[-1][1] or 1)
+            def closeness(a, b):
+                return (b - a) / visible_range < 0.10
+
+        groups = [[points[0]]]
+        for i in range(1, len(points)):
+            if closeness(groups[-1][-1][1], points[i][1]):
+                groups[-1].append(points[i])
+            else:
+                groups.append([points[i]])
+
+        # Annotate each group
+        for group in groups:
+            top_val = group[-1][1]  # highest value in cluster
+
+            # Sort by value descending: highest value label at top of stack
+            group.sort(key=lambda p: -p[1])
+            n = len(group)
+
+            for i, (bench, v) in enumerate(group):
+                text = f'{TAG[bench]}: {fmt(v)}'
+
+                # Handle off-chart points (linear scale with y_cap)
+                if y_cap and v > y_cap:
+                    ax.annotate(f'{TAG[bench]}: {fmt(v)} \u2191',
+                                (x, y_cap * 0.95),
+                                ha='center', fontsize=9,
+                                color='black', fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.15',
+                                          facecolor='white', alpha=0.85,
+                                          edgecolor='gray', linewidth=0.5))
+                    continue
+
+                # Stack: legend-order top-to-bottom, index 0 = highest offset
+                offset_y = 8 + (n - 1 - i) * label_h
+                anchor = min(top_val, y_cap) if y_cap else top_val
+                ax.annotate(text, (x, anchor),
+                            textcoords='offset points',
+                            xytext=(0, offset_y), ha='center', fontsize=9,
+                            color='black', fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.15',
+                                      facecolor='white', alpha=0.85,
+                                      edgecolor='gray', linewidth=0.5))
+
+
 # ── Fig 1: Cycles vs Matrix Size (line graph) ───────────────────────
 
 def plot_cycles(data, sizes, outdir):
     """Fig 1: Cycles vs Matrix Size — line graph with markers."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
 
+    bench_vals = {}
     for bench in BENCH_ORDER:
         s = SERIES[bench]
         vals = [int(v) for v in get_vals(data, bench, sizes, field='cycles')]
+        bench_vals[bench] = vals
         ax.plot(sizes, vals, marker=s['marker'], linestyle=s['linestyle'],
                 color=s['color'], label=s['label'], linewidth=2, markersize=8)
 
-    ax.set_xlabel('Matrix Size (N×N)')
-    ax.set_ylabel('Cycles')
-    ax.set_title('GEMM Execution Cycles by Mode (lower is better)')
+    _annotate_clusters(ax, sizes, bench_vals, is_log=True)
+
+    ax.set_xlabel('Matrix Size (N\u00d7N)')
+    ax.set_ylabel('Cycles (log scale)')
+    ax.set_title('SGEMM Execution Cycles by Mode (lower is better)')
     ax.set_xticks(sizes)
     ax.set_yscale('log')
     ax.legend()
@@ -118,17 +213,22 @@ def plot_cycles(data, sizes, outdir):
 def plot_mflops(data, sizes, outdir):
     """Fig 2: MFLOP/s throughput assuming 100 MHz clock."""
     CLOCK_HZ = 100e6  # 100 MHz (verified via Vivado implementation)
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
 
+    bench_vals = {}
     for bench in BENCH_ORDER:
         s = SERIES[bench]
         vals = get_vals(data, bench, sizes, field='cycles')
         mflops = [(2.0 * sz**3) / (int(v) / CLOCK_HZ) / 1e6 if int(v) > 0 else 0
                   for v, sz in zip(vals, sizes)]
+        bench_vals[bench] = mflops
         ax.plot(sizes, mflops, marker=s['marker'], linestyle=s['linestyle'],
                 color=s['color'], label=s['label'], linewidth=2, markersize=8)
 
-    ax.set_xlabel('Matrix Size (N×N)')
+    _annotate_clusters(ax, sizes, bench_vals, is_log=False,
+                        fmt=lambda v: f'{round(v):,}')
+
+    ax.set_xlabel('Matrix Size (N\u00d7N)')
     ax.set_ylabel('MFLOP/s')
     ax.set_title('Compute Throughput @ 100 MHz (higher is better)')
     ax.set_xticks(sizes)
@@ -144,22 +244,31 @@ def plot_mflops(data, sizes, outdir):
 
 def plot_dcache_miss(data, sizes, outdir):
     """Fig 3: D-cache miss count per mode."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Gather values and compute y-cap from multi-core series
+    multicore_max = 0
+    bench_vals = {}
+    for bench in BENCH_ORDER:
+        vals = [int(v) for v in get_vals(data, bench, sizes, field='dcache_miss')]
+        bench_vals[bench] = vals
+        if bench != 'gemm_single':
+            multicore_max = max(multicore_max, max(vals))
+    y_cap = multicore_max * 1.4
 
     for bench in BENCH_ORDER:
         s = SERIES[bench]
-        vals = [int(v) for v in get_vals(data, bench, sizes, field='dcache_miss')]
-        ax.plot(sizes, vals, marker=s['marker'], linestyle=s['linestyle'],
-                color=s['color'], label=s['label'], linewidth=2, markersize=8)
-        for x, v in zip(sizes, vals):
-            if v > 0:
-                ax.annotate(f'{v}', (x, v), textcoords='offset points',
-                            xytext=(0, 8), ha='center', fontsize=7)
+        ax.plot(sizes, bench_vals[bench], marker=s['marker'],
+                linestyle=s['linestyle'], color=s['color'], label=s['label'],
+                linewidth=2, markersize=8, clip_on=True)
 
-    ax.set_xlabel('Matrix Size (N×N)')
+    _annotate_clusters(ax, sizes, bench_vals, is_log=False, y_cap=y_cap)
+
+    ax.set_xlabel('Matrix Size (N\u00d7N)')
     ax.set_ylabel('D-cache Misses')
     ax.set_title('D-cache Miss Count by Mode (lower is better)')
     ax.set_xticks(sizes)
+    ax.set_ylim(bottom=-0.02 * y_cap, top=y_cap)
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, 'fig3_dcache_miss.png'))
@@ -198,7 +307,7 @@ def plot_stall_breakdown(data, sizes, outdir):
         # Total stall count above each bar
         for xi, total in enumerate(bottom):
             if total > 0:
-                ax.text(xi, total, f'{int(total)}', ha='center', va='bottom', fontsize=7)
+                ax.text(xi, total, f'{int(total)}', ha='center', va='bottom', fontsize=9)
 
         ax.set_title(f'N={sz}')
         ax.set_xticks(x)
@@ -206,9 +315,12 @@ def plot_stall_breakdown(data, sizes, outdir):
 
     for ax in axes:
         ax.set_ylabel('Stall Cycles')
-    axes[0].legend(loc='upper left')
-    fig.suptitle('Pipeline Stall Breakdown (lower is better)')
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    # Grab handles from first axes only (avoid duplicates)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', ncol=4, fontsize=10,
+              bbox_to_anchor=(0.5, 0.93), frameon=True)
+    fig.suptitle('Pipeline Stall Breakdown (lower is better)', fontsize=15, y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.88])
     fig.savefig(os.path.join(outdir, 'fig4_stall_breakdown.png'))
     fig.savefig(os.path.join(outdir, 'fig4_stall_breakdown.pdf'))
     plt.close(fig)
@@ -219,43 +331,58 @@ def plot_stall_breakdown(data, sizes, outdir):
 
 def plot_regression(data, sizes, outdir):
     """Fig 5: MXU vs Vanilla Rocket — MIMD regression test."""
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(8, 5.5))
     x = np.arange(len(sizes))
     width = 0.35
 
     mxu_vals = [int(data.get(('gemm_mimd', s, 'mxu'), {}).get('cycles', 0)) for s in sizes]
     van_vals = [int(data.get(('gemm_mimd', s, 'vanilla'), {}).get('cycles', 0)) for s in sizes]
 
-    mxu_bars = ax.bar(x - width/2, mxu_vals, width, label='MIMD on MXU Rocket',
+    mxu_bars = ax.bar(x - width/2, mxu_vals, width, label='MIMD SGEMM on MXU Rocket',
                       color='#4A90D9', edgecolor='black', linewidth=0.5)
-    van_bars = ax.bar(x + width/2, van_vals, width, label='MIMD on Vanilla Rocket',
+    van_bars = ax.bar(x + width/2, van_vals, width, label='MIMD SGEMM on Baseline Rocket',
                       color='#E74C3C', hatch='//', edgecolor='black', linewidth=0.5)
 
-    # Value labels on each bar
-    for bar, v in zip(mxu_bars, mxu_vals):
-        if v > 0:
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                    f'{v}', ha='center', va='bottom', fontsize=7)
-    for bar, v in zip(van_bars, van_vals):
-        if v > 0:
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                    f'{v}', ha='center', va='bottom', fontsize=7)
+    # Value labels on each bar -- single centered label when values are equal
+    for mbar, vbar, m, v in zip(mxu_bars, van_bars, mxu_vals, van_vals):
+        if m > 0 and v > 0 and m == v:
+            cx = (mbar.get_x() + mbar.get_width() + vbar.get_x()) / 2
+            ax.text(cx, m, f'{m:,}', ha='center', va='bottom', fontsize=10)
+        else:
+            if m > 0:
+                ax.text(mbar.get_x() + mbar.get_width()/2, mbar.get_height(),
+                        f'{m:,}', ha='center', va='bottom', fontsize=10)
+            if v > 0:
+                ax.text(vbar.get_x() + vbar.get_width()/2, vbar.get_height(),
+                        f'{v:,}', ha='center', va='bottom', fontsize=10)
 
-    # Percentage difference annotation
+    # Percentage difference annotation — placed above both bars
     for xi, (m, v) in enumerate(zip(mxu_vals, van_vals)):
         if m > 0 and v > 0:
             pct = (m - v) / v * 100
-            y_pos = max(m, v) * 0.5
-            ax.text(xi, y_pos, f'{pct:+.1f}%', ha='center', va='center',
-                    fontsize=9, fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+            top = max(m, v)
+            if abs(pct) < 0.05:
+                label = '0% $\Delta$'  # delta symbol via mathtext
+                fc = '#d4edda'  # light green
+            else:
+                label = f'{pct:+.1f}%'
+                fc = '#f8d7da' if pct > 0 else '#d4edda'
+            ax.annotate(label, (xi, top),
+                        textcoords='offset points', xytext=(0, 18),
+                        ha='center', fontsize=11, fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor=fc,
+                                  edgecolor='gray', alpha=0.9))
 
-    ax.set_xlabel('Matrix Size (N×N)')
-    ax.set_ylabel('Cycles')
-    ax.set_title('MIMD Regression: MXU vs Vanilla Rocket (lower is better)')
+    ax.set_xlabel('Matrix Size (N\u00d7N)', fontsize=13)
+    ax.set_ylabel('Cycles', fontsize=13)
     ax.set_xticks(x)
-    ax.set_xticklabels([str(s) for s in sizes])
-    ax.legend()
+    ax.set_xticklabels([str(s) for s in sizes], fontsize=11)
+    ax.tick_params(axis='y', labelsize=11)
+    ax.legend(fontsize=10)
+    # Add headroom for annotations above tallest bar
+    ymax = max(max(mxu_vals), max(van_vals))
+    ax.set_ylim(top=ymax * 1.15)
+    ax.set_title('MIMD Regression: MXU vs Baseline Rocket (lower is better)', fontsize=15)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, 'fig5_regression.png'))
     fig.savefig(os.path.join(outdir, 'fig5_regression.pdf'))

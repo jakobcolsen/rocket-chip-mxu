@@ -3,7 +3,7 @@
 #
 # Compiles all benchmarks, runs each through Verilator,
 # parses cycle/instret counts, computes derived metrics,
-# and writes results to results.csv.
+# and writes results to results_v2.csv.
 #
 # Usage:
 #   ./run_benchmarks.sh                  — run full suite
@@ -20,7 +20,7 @@ CHIPYARD_DIR="${CHIPYARD:-$HOME/chipyard}"
 SIM_DIR="$CHIPYARD_DIR/sims/verilator"
 CONFIG="VerilatorQuadRocketMXUConfig"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
-RESULTS_CSV="$BENCH_DIR/results.csv"
+RESULTS_CSV="$BENCH_DIR/results_v2.csv"
 TIMEOUT=3600 # seconds per simulation
 
 # Find the simulator binary
